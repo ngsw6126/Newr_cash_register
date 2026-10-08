@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>レジ精算アプリ</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         body {
@@ -165,6 +166,97 @@
         table tr:hover {
             background-color: #e2e6ea;
         }
+        .ocr-section {
+            border: 2px dashed #007bff;
+            border-radius: 12px;
+            padding: 20px;
+            background-color: #f5f9ff;
+        }
+        .ocr-section h2 {
+            margin-bottom: 10px;
+        }
+        .ocr-note {
+            color: #5a6b7b;
+            font-size: 0.9rem;
+            text-align: center;
+            margin-bottom: 15px;
+        }
+        .camera-button {
+            display: block;
+            width: 100%;
+            box-sizing: border-box;
+            padding: 14px 12px;
+            background-color: #28a745;
+            color: white;
+            border-radius: 8px;
+            font-size: 1.15rem;
+            font-weight: 600;
+            text-align: center;
+            cursor: pointer;
+            box-shadow: 0 4px 10px rgba(40, 167, 69, 0.3);
+        }
+        .camera-button:hover {
+            background-color: #1e7e34;
+        }
+        .camera-button.disabled {
+            background-color: #9fb8a6;
+            cursor: wait;
+            pointer-events: none;
+        }
+        #receiptInput {
+            display: none;
+        }
+        #ocrPreview {
+            display: none;
+            max-width: 100%;
+            max-height: 300px;
+            margin: 15px auto 0;
+            border-radius: 6px;
+            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1);
+        }
+        #ocrStatus {
+            margin-top: 12px;
+            text-align: center;
+            font-size: 0.95rem;
+            color: #34495e;
+        }
+        #ocrChecks {
+            margin-top: 10px;
+            padding: 0;
+            list-style: none;
+        }
+        #ocrChecks li {
+            padding: 8px 12px;
+            margin-top: 6px;
+            border-radius: 6px;
+            font-size: 0.9rem;
+        }
+        #ocrChecks li.ok {
+            background-color: #e6f4ea;
+            color: #1e7e34;
+        }
+        #ocrChecks li.ng {
+            background-color: #fdecea;
+            color: #b02a37;
+        }
+        #ocrRawWrap {
+            display: none;
+            margin-top: 10px;
+            font-size: 0.85rem;
+            color: #5a6b7b;
+        }
+        #ocrRaw {
+            white-space: pre-wrap;
+            max-height: 300px;
+            overflow-y: auto;
+            background-color: #ffffff;
+            padding: 10px;
+            border-radius: 6px;
+        }
+        .input-group input.ocr-filled {
+            background-color: #fff8db;
+            border-color: #f0ad4e;
+        }
         @media (max-width: 768px) {
             .input-section-container {
                 flex-direction: column;
@@ -179,6 +271,23 @@
 <body>
     <div class="container">
         <h1>レジ精算アプリ</h1>
+
+        <div class="ocr-section">
+            <h2>売上日報を撮影して読み取り</h2>
+            <p class="ocr-note">
+                ①＊＝合計・②レジ客数・③+現金・④+掛売・⑤-ギフト釣銭・⑥+消費税等 を自動入力します。<br>
+                レシートを真上から、画面いっぱいに明るく撮影してください。読み取り後は必ず値を確認してください。
+            </p>
+            <label for="receiptInput" id="cameraButton" class="camera-button">📷 売上日報を撮影する</label>
+            <input type="file" id="receiptInput" accept="image/*" capture="environment">
+            <img id="ocrPreview" alt="撮影した売上日報">
+            <div id="ocrStatus"></div>
+            <ul id="ocrChecks"></ul>
+            <details id="ocrRawWrap">
+                <summary>読み取ったテキストを表示</summary>
+                <pre id="ocrRaw"></pre>
+            </details>
+        </div>
 
         <div class="input-section-container">
             <div class="input-section">
@@ -382,8 +491,277 @@
             const inputFields = document.querySelectorAll('.input-section input[type="number"]');
             inputFields.forEach(input => {
                 input.addEventListener('input', calculateSettlement);
+                input.addEventListener('input', () => input.classList.remove('ocr-filled'));
             });
             calculateSettlement();
+
+            // ===== 売上日報の撮影・読み取り =====
+            const receiptInput = document.getElementById('receiptInput');
+            const cameraButton = document.getElementById('cameraButton');
+            const ocrPreview = document.getElementById('ocrPreview');
+            const ocrStatus = document.getElementById('ocrStatus');
+            const ocrChecks = document.getElementById('ocrChecks');
+            const ocrRawWrap = document.getElementById('ocrRawWrap');
+            const ocrRaw = document.getElementById('ocrRaw');
+
+            // 読み取り結果 → 入力欄
+            const OCR_FIELDS = {
+                total: 'inputA',
+                customers: 'inputB',
+                cash: 'inputC',
+                credit: 'inputK',
+                change: 'inputQ',
+                tax: 'inputR',
+            };
+            const OCR_LABELS = {
+                total: '①＊＝合計',
+                customers: '②レジ客数',
+                cash: '③+現金',
+                credit: '④+掛売',
+                change: '⑤-ギフト釣銭',
+                tax: '⑥+消費税等',
+            };
+            // 画像を拡大する幅（px）。結果が揺れるため複数の幅で読み取り、多数決を取る
+            const OCR_WIDTHS = [940, 800, 1100, 1300];
+
+            let ocrWorker = null;
+
+            function toNumber(str) {
+                return parseInt(str.replace(/[^\d]/g, ''), 10);
+            }
+
+            // OCRテキスト1回分から各項目の値を抜き出す
+            function parseReceiptText(text) {
+                const lines = text.split(/\r?\n/).map(raw => {
+                    const tokens = raw.trim().split(/\s+/);
+                    const compact = raw.replace(/\s+/g, '');
+                    const last = tokens[tokens.length - 1] || '';
+                    const tokenMatch = last.match(/^\(?(\d[\d,.]*)\)?$/);
+                    const tailMatch = compact.match(/(\d[\d,.]*)\D{0,2}$/);
+                    const numText = tokenMatch ? tokenMatch[1] : (tailMatch ? tailMatch[1] : null);
+                    return { text: compact, numText, value: numText ? toNumber(numText) : null };
+                }).filter(l => l.text.length > 0);
+
+                const has = (s, ...words) => words.some(w => s.includes(w));
+                const find = (test, from = 0) => {
+                    for (let i = Math.max(from, 0); i < lines.length; i++) {
+                        if (lines[i].value !== null && test(lines[i].text)) return i;
+                    }
+                    return -1;
+                };
+                const valueAt = i => (i >= 0 && i < lines.length ? lines[i].value : null);
+
+                const idx = {};
+                idx.sales = find(s => has(s, '売上合計'));
+                idx.customers = find(s => has(s, '客数'));
+                idx.unitPrice = find(s => has(s, '単価'), idx.customers);
+                idx.tax = find(s => has(s, '税等') || (has(s, '消費税') && !has(s, '値引')), idx.customers);
+                idx.total = find(s => has(s, '合計', '合', '=') && !has(s, '通常', '軽減', '売上', 'メニュー', '割増', '税'), idx.tax + 1);
+                idx.cash = find(s => has(s, '現金', '現'), idx.total + 1);
+                // 現金は【支払内訳】の次の行
+                if (idx.cash < 0) {
+                    const heading = lines.findIndex((l, i) => i > idx.total && has(l.text, '支払', '内訳'));
+                    if (heading >= 0) idx.cash = find(() => true, heading + 1);
+                }
+                idx.change = find(s => has(s, 'ギフ', 'フト') && has(s, '釣', '銭'), idx.cash + 1);
+                // ギフト釣銭は「ギフト過剰」の次の行
+                if (idx.change < 0) {
+                    const excess = find(s => has(s, '過剰'), idx.cash + 1);
+                    if (excess >= 0) idx.change = find(() => true, excess + 1);
+                }
+                idx.credit = find(s => has(s, '掛売', '掛'), idx.cash + 1);
+                // 掛売はギフト釣銭の次の行
+                if (idx.credit < 0 && idx.change >= 0) idx.credit = idx.change + 1;
+
+                // レジ単価は小数第2位まで（例: 1,147.85）。区切りの誤読に備えて末尾2桁を小数とみなす
+                const unitDigits = idx.unitPrice >= 0 ? lines[idx.unitPrice].numText.replace(/[^\d]/g, '') : '';
+
+                return {
+                    total: valueAt(idx.total),
+                    customers: valueAt(idx.customers),
+                    cash: valueAt(idx.cash),
+                    credit: valueAt(idx.credit),
+                    change: valueAt(idx.change),
+                    tax: valueAt(idx.tax),
+                    sales: valueAt(idx.sales),
+                    unitPrice: unitDigits.length >= 3 ? parseInt(unitDigits, 10) / 100 : null,
+                    // 「+ギフト」は現金の次の行（検算用）
+                    gift: idx.cash >= 0 ? valueAt(idx.cash + 1) : null,
+                };
+            }
+
+            // 複数回のOCR結果を多数決でまとめ、レシートの検算で裏付ける
+            function combineResults(results) {
+                const keys = ['total', 'customers', 'cash', 'credit', 'change', 'tax', 'sales', 'unitPrice', 'gift'];
+                const candidates = {};
+                const pick = {};
+                for (const key of keys) {
+                    const counts = new Map();
+                    for (const r of results) {
+                        if (r[key] !== null && !isNaN(r[key])) counts.set(r[key], (counts.get(r[key]) || 0) + 1);
+                    }
+                    candidates[key] = [...counts.entries()].sort((a, b) => b[1] - a[1]).map(e => e[0]);
+                    pick[key] = candidates[key].length ? candidates[key][0] : null;
+                }
+
+                // 合計 = 売上合計 + 消費税等
+                findCombination(() => {
+                    for (const total of candidates.total)
+                        for (const sales of candidates.sales)
+                            for (const tax of candidates.tax)
+                                if (sales + tax === total) return { total, sales, tax };
+                });
+                // 合計 = 現金 + ギフト + 掛売
+                findCombination(() => {
+                    if (pick.total === null) return;
+                    for (const cash of candidates.cash)
+                        for (const gift of candidates.gift)
+                            for (const credit of candidates.credit)
+                                if (cash + gift + credit === pick.total) return { cash, gift, credit };
+                });
+                // 売上合計 ÷ 客数 = レジ単価
+                findCombination(() => {
+                    if (pick.sales === null) return;
+                    for (const customers of candidates.customers)
+                        for (const unitPrice of candidates.unitPrice)
+                            if (customers > 0 && Math.abs(pick.sales / customers - unitPrice) < 0.01) return { customers, unitPrice };
+                });
+
+                function findCombination(search) {
+                    const found = search();
+                    if (found) Object.assign(pick, found);
+                }
+
+                const checks = [];
+                if (pick.total !== null && pick.sales !== null && pick.tax !== null) {
+                    checks.push({ label: '売上合計 + 消費税等 = ＊＝合計', ok: pick.sales + pick.tax === pick.total });
+                }
+                // ギフト釣銭がある日は支払内訳の内訳が変わるため、この検算は釣銭0円の日だけ行う
+                if (pick.change === 0 && pick.total !== null && pick.cash !== null && pick.gift !== null && pick.credit !== null) {
+                    checks.push({ label: '現金 + ギフト + 掛売 = ＊＝合計', ok: pick.cash + pick.gift + pick.credit === pick.total });
+                }
+                if (pick.sales !== null && pick.customers && pick.unitPrice !== null) {
+                    checks.push({ label: '売上合計 ÷ レジ客数 = レジ単価', ok: Math.abs(pick.sales / pick.customers - pick.unitPrice) < 0.01 });
+                }
+                return { values: pick, checks };
+            }
+
+            // 指定幅に拡大・縮小し、グレースケール化とコントラスト補正をかける
+            function preprocess(image, width) {
+                const scale = width / image.width;
+                const canvas = document.createElement('canvas');
+                canvas.width = width;
+                canvas.height = Math.round(image.height * scale);
+                const ctx = canvas.getContext('2d');
+                ctx.imageSmoothingQuality = 'high';
+                ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+
+                const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                const d = img.data;
+                const gray = new Uint8ClampedArray(d.length / 4);
+                const hist = new Array(256).fill(0);
+                for (let i = 0; i < gray.length; i++) {
+                    gray[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+                    hist[gray[i]]++;
+                }
+                // 上下1%を除いた明るさの範囲を0〜255に引き伸ばす
+                let low = 0, high = 255, acc = 0;
+                for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= gray.length * 0.01) { low = v; break; } }
+                acc = 0;
+                for (let v = 255; v >= 0; v--) { acc += hist[v]; if (acc >= gray.length * 0.01) { high = v; break; } }
+                const range = Math.max(high - low, 1);
+                for (let i = 0; i < gray.length; i++) {
+                    const v = (gray[i] - low) * 255 / range;
+                    d[i * 4] = d[i * 4 + 1] = d[i * 4 + 2] = v;
+                }
+                ctx.putImageData(img, 0, 0);
+                return canvas;
+            }
+
+            function loadImage(file) {
+                return new Promise((resolve, reject) => {
+                    const img = new Image();
+                    img.onload = () => resolve(img);
+                    img.onerror = () => reject(new Error('画像を読み込めませんでした'));
+                    img.src = URL.createObjectURL(file);
+                });
+            }
+
+            async function getWorker() {
+                if (!ocrWorker) {
+                    ocrStatus.textContent = '読み取りの準備中…（初回は日本語データのダウンロードに時間がかかります）';
+                    ocrWorker = await Tesseract.createWorker('jpn');
+                    await ocrWorker.setParameters({ tessedit_pageseg_mode: '6' });
+                }
+                return ocrWorker;
+            }
+
+            function showChecks(checks) {
+                ocrChecks.innerHTML = '';
+                for (const check of checks) {
+                    const li = document.createElement('li');
+                    li.className = check.ok ? 'ok' : 'ng';
+                    li.textContent = (check.ok ? '✓ 検算OK: ' : '⚠ 検算が合いません: ') + check.label;
+                    ocrChecks.appendChild(li);
+                }
+            }
+
+            async function readReceipt(file) {
+                cameraButton.classList.add('disabled');
+                ocrChecks.innerHTML = '';
+                ocrRawWrap.style.display = 'none';
+                try {
+                    const image = await loadImage(file);
+                    ocrPreview.src = image.src;
+                    ocrPreview.style.display = 'block';
+
+                    const worker = await getWorker();
+                    const results = [];
+                    let combined = null;
+                    for (let i = 0; i < OCR_WIDTHS.length; i++) {
+                        ocrStatus.textContent = `読み取り中…（${i + 1}/${OCR_WIDTHS.length}回目）`;
+                        const { data } = await worker.recognize(preprocess(image, OCR_WIDTHS[i]));
+                        results.push(parseReceiptText(data.text));
+                        ocrRaw.textContent = data.text;
+                        combined = combineResults(results);
+                        const allFound = Object.keys(OCR_FIELDS).every(key => combined.values[key] !== null);
+                        // 全項目が揃い、検算がすべて合えば終了
+                        if (allFound && combined.checks.length >= 2 && combined.checks.every(c => c.ok)) break;
+                    }
+
+                    const missing = [];
+                    for (const [key, id] of Object.entries(OCR_FIELDS)) {
+                        const input = document.getElementById(id);
+                        const value = combined.values[key];
+                        if (value === null) {
+                            missing.push(OCR_LABELS[key]);
+                            continue;
+                        }
+                        input.value = value;
+                        input.classList.add('ocr-filled');
+                    }
+                    calculateSettlement();
+                    showChecks(combined.checks);
+                    ocrRawWrap.style.display = 'block';
+                    if (missing.length) {
+                        ocrStatus.textContent = `読み取れなかった項目: ${missing.join('、')}（手入力してください）`;
+                    } else if (combined.checks.some(c => !c.ok)) {
+                        ocrStatus.textContent = '⚠ 検算が合わない項目があります。黄色の欄をレシートと見比べて修正するか、撮り直してください。';
+                    } else {
+                        ocrStatus.textContent = '読み取り完了。黄色の欄の値がレシートと合っているか確認してください。';
+                    }
+                } catch (err) {
+                    console.error(err);
+                    ocrStatus.textContent = '読み取りに失敗しました: ' + err.message;
+                } finally {
+                    cameraButton.classList.remove('disabled');
+                    receiptInput.value = '';
+                }
+            }
+
+            receiptInput.addEventListener('change', () => {
+                if (receiptInput.files.length > 0) readReceipt(receiptInput.files[0]);
+            });
         });
     </script>
 </body>
