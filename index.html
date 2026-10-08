@@ -647,14 +647,81 @@
             }
 
             // 指定幅に拡大・縮小し、グレースケール化とコントラスト補正をかける
-            function preprocess(image, width) {
-                const scale = width / image.width;
+            // 写真の中から白いレシート部分の範囲を探す（見つからなければ写真全体）
+            function findReceiptBounds(image) {
+                const full = { x: 0, y: 0, w: image.width, h: image.height };
+                const sw = 300;
+                const sh = Math.max(1, Math.round(image.height * sw / image.width));
+                const canvas = document.createElement('canvas');
+                canvas.width = sw;
+                canvas.height = sh;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(image, 0, 0, sw, sh);
+                const d = ctx.getImageData(0, 0, sw, sh).data;
+                const gray = (x, y) => {
+                    const i = (y * sw + x) * 4;
+                    return 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+                };
+
+                // 明るい部分が最も長く続く区間を返す
+                function brightestRun(means) {
+                    const min = Math.min(...means);
+                    const max = Math.max(...means);
+                    if (max - min < 60) return null; // 背景との差がない＝レシートが全体に写っている
+                    // 文字の多い部分は少し暗くなるため、しきい値は背景寄りに置く
+                    const threshold = min + (max - min) * 0.35;
+                    const maxGap = Math.round(means.length * 0.03); // これより短い暗い区間はレシートの一部とみなす
+                    let best = null, start = -1, lastBright = -1;
+                    for (let i = 0; i <= means.length; i++) {
+                        if (i < means.length && means[i] >= threshold) {
+                            if (start < 0) start = i;
+                            lastBright = i;
+                        } else if (start >= 0 && (i === means.length || i - lastBright > maxGap)) {
+                            const end = lastBright + 1;
+                            if (!best || end - start > best.end - best.start) best = { start, end };
+                            start = -1;
+                        }
+                    }
+                    return best;
+                }
+
+                const colMeans = [];
+                for (let x = 0; x < sw; x++) {
+                    let sum = 0;
+                    for (let y = 0; y < sh; y++) sum += gray(x, y);
+                    colMeans.push(sum / sh);
+                }
+                const cols = brightestRun(colMeans) || { start: 0, end: sw };
+                if (cols.end - cols.start < sw * 0.15) return full;
+
+                const rowMeans = [];
+                for (let y = 0; y < sh; y++) {
+                    let sum = 0;
+                    for (let x = cols.start; x < cols.end; x++) sum += gray(x, y);
+                    rowMeans.push(sum / (cols.end - cols.start));
+                }
+                const rows = brightestRun(rowMeans) || { start: 0, end: sh };
+                if (rows.end - rows.start < sh * 0.15) return full;
+
+                // 少し余白を付けて元画像の座標に戻す
+                const ratio = image.width / sw;
+                const mx = (cols.end - cols.start) * 0.03;
+                const my = (rows.end - rows.start) * 0.01;
+                const x0 = Math.max(0, (cols.start - mx) * ratio);
+                const y0 = Math.max(0, (rows.start - my) * ratio);
+                const x1 = Math.min(image.width, (cols.end + mx) * ratio);
+                const y1 = Math.min(image.height, (rows.end + my) * ratio);
+                return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+            }
+
+            function preprocess(image, bounds, width) {
+                const scale = width / bounds.w;
                 const canvas = document.createElement('canvas');
                 canvas.width = width;
-                canvas.height = Math.round(image.height * scale);
+                canvas.height = Math.round(bounds.h * scale);
                 const ctx = canvas.getContext('2d');
                 ctx.imageSmoothingQuality = 'high';
-                ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+                ctx.drawImage(image, bounds.x, bounds.y, bounds.w, bounds.h, 0, 0, canvas.width, canvas.height);
 
                 const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
                 const d = img.data;
@@ -712,7 +779,9 @@
                 ocrRawWrap.style.display = 'none';
                 try {
                     const image = await loadImage(file);
-                    ocrPreview.src = image.src;
+                    // 読み取りに使うレシート部分をプレビューに表示
+                    const bounds = findReceiptBounds(image);
+                    ocrPreview.src = preprocess(image, bounds, 600).toDataURL('image/jpeg', 0.8);
                     ocrPreview.style.display = 'block';
 
                     const worker = await getWorker();
@@ -720,7 +789,7 @@
                     let combined = null;
                     for (let i = 0; i < OCR_WIDTHS.length; i++) {
                         ocrStatus.textContent = `読み取り中…（${i + 1}/${OCR_WIDTHS.length}回目）`;
-                        const { data } = await worker.recognize(preprocess(image, OCR_WIDTHS[i]));
+                        const { data } = await worker.recognize(preprocess(image, bounds, OCR_WIDTHS[i]));
                         results.push(parseReceiptText(data.text));
                         ocrRaw.textContent = data.text;
                         combined = combineResults(results);
