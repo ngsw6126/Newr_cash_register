@@ -852,9 +852,20 @@
                 return [...set];
             };
 
-            // 値引・リハーサル・特地税（通常0）は読み取り値をそのまま使う
-            const adjust = -(read('discount') || 0) + (read('discountExcess') || 0) + (read('discountChange') || 0)
-                - (read('rehearsal') || 0) + (read('localTax') || 0);
+            // 値引・リハーサル・特地税などはほとんどの日が0。「0」を「8」と読むこともあるため、
+            // 読み取り値と0の両方を候補にして、検算が合う方を選ぶ
+            const zeroOrRead = key => { const r = read(key); return r ? [r, 0] : [0]; };
+            const RARE = 0.05; // 0以外はまれなので、検算上同点なら0を選ぶ
+            const ADJUST_ROWS = [['discount', -1], ['discountExcess', 1], ['discountChange', 1], ['rehearsal', -1], ['localTax', 1]];
+            let adjustList = [{ adj: 0, c: 0 }];
+            for (const [key, sign] of ADJUST_ROWS) {
+                const next = [];
+                for (const a of adjustList) for (const val of zeroOrRead(key)) next.push({ adj: a.adj + sign * val, c: a.c + cost(key, val) + (val ? RARE : 0) });
+                adjustList = next;
+            }
+            const bestAdj = new Map();
+            for (const a of adjustList) if (!bestAdj.has(a.adj) || bestAdj.get(a.adj) > a.c) bestAdj.set(a.adj, a.c);
+            adjustList = [...bestAdj].map(([adj, c]) => ({ adj, c }));
 
             // 売上（通常）・売上（軽減）・税（通常）・税（軽減）を決めれば、合計などは計算で決まる。
             // 同じ値が3行ずつ印字されているので、それぞれ見込みの高い候補に絞る
@@ -878,9 +889,12 @@
                 for (const xn of xnList) {
                     const cn = cost('taxNormal', xn) + cost('totalNormal', sn + xn);
                     for (const xr of xrList) {
-                        const c = sc + cn + cost('taxReduced', xr) + cost('totalReduced', sr + xr)
-                            + cost('tax', xn + xr) + cost('total', sn + sr + xn + xr + adjust);
-                        if (c < bestCost) { bestCost = c; best = { sn, sr, xn, xr }; }
+                        const base = sc + cn + cost('taxReduced', xr) + cost('totalReduced', sr + xr) + cost('tax', xn + xr);
+                        if (base >= bestCost) continue;
+                        for (const { adj, c: ac } of adjustList) {
+                            const c = base + ac + cost('total', sn + sr + xn + xr + adj);
+                            if (c < bestCost) { bestCost = c; best = { sn, sr, xn, xr, adj }; }
+                        }
                     }
                 }
             }
@@ -889,7 +903,7 @@
             if (best) {
                 v.sales = best.sn + best.sr;
                 v.tax = best.xn + best.xr;
-                v.total = v.sales + v.tax + adjust;
+                v.total = v.sales + v.tax + best.adj;
                 v.salesNormal = best.sn;
                 v.salesReduced = best.sr;
             } else {
@@ -917,14 +931,22 @@
             const cashC = candidatesFrom('cash'), giftC = candidatesFrom('gift'), creditC = candidatesFrom('credit');
             if (v.total !== null) {
                 let bp = null, bpc = Infinity;
-                const pay = (c, g, k) => cost('cash', c) + cost('gift', g) + cost('credit', k);
-                const fixed = v.total + v.giftExcess + v.change;
-                const tryPay = (c, g, k) => { if (c >= 0 && g >= 0 && k >= 0) { const s = pay(c, g, k); if (s < bpc) { bpc = s; bp = [c, g, k]; } } };
-                // 3つのうち2つを候補から選び、残り1つは合計から逆算
-                for (const c of cashC) for (const g of giftC) tryPay(c, g, fixed - c - g);
-                for (const c of cashC) for (const k of creditC) tryPay(c, fixed - c - k, k);
-                for (const g of giftC) for (const k of creditC) tryPay(fixed - g - k, g, k);
-                if (bp) [v.cash, v.gift, v.credit] = bp;
+                for (const e of zeroOrRead('giftExcess')) {
+                    for (const q of zeroOrRead('giftChange')) {
+                        const fixed = v.total + e + q;
+                        const extra = cost('giftExcess', e) + cost('giftChange', q) + (e ? RARE : 0) + (q ? RARE : 0);
+                        const tryPay = (c, g, k) => {
+                            if (c < 0 || g < 0 || k < 0) return;
+                            const s = extra + cost('cash', c) + cost('gift', g) + cost('credit', k);
+                            if (s < bpc) { bpc = s; bp = [c, g, k, e, q]; }
+                        };
+                        // 3つのうち2つを候補から選び、残り1つは合計から逆算
+                        for (const c of cashC) for (const g of giftC) tryPay(c, g, fixed - c - g);
+                        for (const c of cashC) for (const k of creditC) tryPay(c, fixed - c - k, k);
+                        for (const g of giftC) for (const k of creditC) tryPay(fixed - g - k, g, k);
+                    }
+                }
+                if (bp) [v.cash, v.gift, v.credit, v.giftExcess, v.change] = bp;
             }
             if (v.cash === undefined) { v.cash = read('cash'); v.gift = read('gift'); v.credit = read('credit'); }
 
