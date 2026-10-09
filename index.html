@@ -220,24 +220,60 @@
             font-size: 0.95rem;
             color: #34495e;
         }
-        #ocrChecks {
-            margin-top: 10px;
+        .ocr-result-block {
+            margin-top: 12px;
+        }
+        .ocr-result-block h3 {
+            font-size: 1rem;
+            font-weight: 700;
+            color: #2c3e50;
+            margin-bottom: 6px;
+        }
+        .ocr-checks {
             padding: 0;
             list-style: none;
         }
-        #ocrChecks li {
+        .ocr-checks li {
             padding: 8px 12px;
             margin-top: 6px;
             border-radius: 6px;
             font-size: 0.9rem;
         }
-        #ocrChecks li.ok {
+        .ocr-checks li.ok {
             background-color: #e6f4ea;
             color: #1e7e34;
         }
-        #ocrChecks li.ng {
+        .ocr-checks li.ng {
             background-color: #fdecea;
             color: #b02a37;
+        }
+        .ocr-note-small {
+            margin-top: 8px;
+            font-size: 0.85rem;
+            color: #5a6b7b;
+        }
+        table.ocr-gift-table {
+            margin-top: 8px;
+        }
+        table.ocr-gift-table th,
+        table.ocr-gift-table td {
+            width: auto;
+            padding: 8px;
+            color: #34495e;
+            font-weight: 500;
+        }
+        table.ocr-gift-table th,
+        table.ocr-gift-table td:nth-child(n+2) {
+            text-align: right;
+            white-space: nowrap;
+        }
+        table.ocr-gift-table select {
+            width: 100%;
+            padding: 6px;
+            border: 1px solid #ced4da;
+            border-radius: 6px;
+            font-size: 0.9rem;
+            background-color: #ffffff;
         }
         #ocrRawWrap {
             display: none;
@@ -273,18 +309,19 @@
         <h1>レジ精算アプリ</h1>
 
         <div class="ocr-section">
-            <h2>売上日報を撮影して読み取り</h2>
+            <h2>日報を撮影して読み取り</h2>
             <p class="ocr-note">
-                ①＊＝合計・②レジ客数・③+現金・④+掛売・⑤-ギフト釣銭・⑥+消費税等 を自動入力します。<br>
-                レシートを真上から、画面いっぱいに明るく撮影してください。読み取り後は必ず値を確認してください。
+                売上日報・ギフト別日報のどちらも撮影できます（種類は自動で判別します）。<br>
+                売上日報は【売上】から【取消】まで、ギフト別日報は全体が入るように撮影してください。<br>
+                読み取り後は必ず値を確認してください。
             </p>
-            <label for="receiptInput" id="cameraButton" class="camera-button">📷 売上日報を撮影する</label>
+            <label for="receiptInput" id="cameraButton" class="camera-button">📷 日報を撮影する</label>
             <input type="file" id="receiptInput" accept="image/*" capture="environment">
-            <img id="ocrPreview" alt="撮影した売上日報">
+            <img id="ocrPreview" alt="読み取りに使った画像">
             <div id="ocrStatus"></div>
-            <ul id="ocrChecks"></ul>
+            <div id="ocrResult"></div>
             <details id="ocrRawWrap">
-                <summary>読み取ったテキストを表示</summary>
+                <summary>読み取った内容を表示</summary>
                 <pre id="ocrRaw"></pre>
             </details>
         </div>
@@ -434,6 +471,564 @@
             </table>
         </div>
     </div>
+    <script id="receipt-core">
+    // ===== レシート解析ロジック（画像の読み込み・OCR エンジンに依存しない部分） =====
+    // 画像は明るさの配列 gray（幅 w × 高さ h、0=黒 255=白）で受け取る
+    const ReceiptCore = (() => {
+        // ---------- 紙の位置 ----------
+        // 紙の左右の縁（上から下まで同じ向きの明暗差が続く列）を探す。見つからない側は画像の端
+        function findPaperColumns(gray, w, h) {
+            const k = 2;
+            const minRatio = 0.55;
+            let left = 0, right = w, bestL = minRatio, bestR = minRatio;
+            for (let x = k; x < w - k; x++) {
+                let p = 0, n = 0;
+                for (let y = 0; y < h; y++) {
+                    const d = gray[y * w + x + k] - gray[y * w + x - k];
+                    if (d > 12) p++;
+                    if (d < -12) n++;
+                }
+                if (x < w * 0.45 && p / h > bestL) { bestL = p / h; left = x + k; }
+                if (x > w * 0.55 && n / h > bestR) { bestR = n / h; right = x - k; }
+            }
+            return { left, right };
+        }
+
+        // ---------- 文字の切り出し ----------
+        function otsu(values) {
+            const hist = new Array(256).fill(0);
+            for (let i = 0; i < values.length; i++) hist[values[i]]++;
+            let sum = 0;
+            for (let i = 0; i < 256; i++) sum += i * hist[i];
+            let sB = 0, wB = 0, best = 0, th = 128;
+            for (let t = 0; t < 256; t++) {
+                wB += hist[t];
+                if (!wB) continue;
+                const wF = values.length - wB;
+                if (!wF) break;
+                sB += t * hist[t];
+                const mB = sB / wB, mF = (sum - sB) / wF;
+                const v = wB * wF * (mB - mF) ** 2;
+                if (v > best) { best = v; th = t; }
+            }
+            return th;
+        }
+
+        // 指定範囲を白黒にする（ink=1 が文字）。
+        // 影などで明るさにむらがあるため、周囲の平均より十分暗い点を文字とみなす
+        function binarize(gray, w, h, x0, y0, x1, y1) {
+            x0 = Math.max(0, Math.round(x0)); x1 = Math.min(w, Math.round(x1));
+            y0 = Math.max(0, Math.round(y0)); y1 = Math.min(h, Math.round(y1));
+            const rw = x1 - x0, rh = y1 - y0;
+            if (rw < 3 || rh < 3) return null;
+            // 周囲の平均は少し広めの範囲で求める
+            const r = 24;
+            const ex0 = Math.max(0, x0 - r), ex1 = Math.min(w, x1 + r);
+            const ey0 = Math.max(0, y0 - r), ey1 = Math.min(h, y1 + r);
+            const ew = ex1 - ex0, eh = ey1 - ey0;
+            const integral = new Float64Array((ew + 1) * (eh + 1));
+            for (let y = 0; y < eh; y++) {
+                let rowSum = 0;
+                for (let x = 0; x < ew; x++) {
+                    rowSum += gray[(ey0 + y) * w + ex0 + x];
+                    integral[(y + 1) * (ew + 1) + x + 1] = integral[y * (ew + 1) + x + 1] + rowSum;
+                }
+            }
+            const ink = new Uint8Array(rw * rh);
+            for (let y = 0; y < rh; y++) {
+                const gy = y0 + y - ey0;
+                const ya = Math.max(0, gy - r), yb = Math.min(eh, gy + r + 1);
+                for (let x = 0; x < rw; x++) {
+                    const gx = x0 + x - ex0;
+                    const xa = Math.max(0, gx - r), xb = Math.min(ew, gx + r + 1);
+                    const sum = integral[yb * (ew + 1) + xb] - integral[ya * (ew + 1) + xb] - integral[yb * (ew + 1) + xa] + integral[ya * (ew + 1) + xa];
+                    const mean = sum / ((yb - ya) * (xb - xa));
+                    const v = gray[(y0 + y) * w + x0 + x];
+                    ink[y * rw + x] = v < mean * 0.78 && v < 170 ? 1 : 0;
+                }
+            }
+            return { ink, rw, rh, x0, y0 };
+        }
+
+        // 写真の傾き（度、時計回りが正）を推定する。文字の行が横一直線にそろう角度を探す。
+        // 机の木目などの影響を避けるため、紙がある可能性の高い中央部分だけを見る
+        function estimateSkew(gray, w, h) {
+            const b = binarize(gray, w, h, w * 0.3, h * 0.05, w * 0.7, h * 0.95);
+            if (!b) return 0;
+            const pts = [];
+            for (let y = 0; y < b.rh; y++) for (let x = 0; x < b.rw; x++) if (b.ink[y * b.rw + x]) pts.push(x, y);
+            if (pts.length < 200) return 0;
+            const score = deg => {
+                const t = Math.tan(deg * Math.PI / 180);
+                const off = Math.ceil(b.rw * Math.abs(t)) + 1;
+                const hist = new Float64Array(b.rh + off * 2);
+                for (let i = 0; i < pts.length; i += 2) hist[Math.round(pts[i + 1] - pts[i] * t) + off]++;
+                let sq = 0;
+                for (let i = 0; i < hist.length; i++) sq += hist[i] * hist[i];
+                return sq;
+            };
+            let best = 0, bestScore = -1;
+            for (let d = -10; d <= 10; d += 0.5) { const sc = score(d); if (sc > bestScore) { bestScore = sc; best = d; } }
+            // 細かく詰める
+            const center = best;
+            for (let d = center - 0.5; d <= center + 0.5; d += 0.1) { const sc = score(d); if (sc > bestScore) { bestScore = sc; best = d; } }
+            return Math.round(best * 10) / 10;
+        }
+
+        // 数字の列（画像の右側）を横に走査し、数字の行の上下位置を返す
+        function findNumberLines(gray, w, h, fromX) {
+            const b = binarize(gray, w, h, w * fromX, 0, w, h);
+            if (!b) return [];
+            const minInk = Math.max(2, b.rw * 0.004);
+            const rows = [];
+            for (let y = 0; y < b.rh; y++) {
+                let c = 0;
+                for (let x = 0; x < b.rw; x++) c += b.ink[y * b.rw + x];
+                rows.push(c >= minInk);
+            }
+            const runs = [];
+            let s = -1;
+            for (let y = 0; y <= b.rh; y++) {
+                if (y < b.rh && rows[y]) { if (s < 0) s = y; }
+                else if (s >= 0) { runs.push([s, y]); s = -1; }
+            }
+            if (!runs.length) return [];
+            const heights = runs.map(r => r[1] - r[0]).sort((a, c) => a - c);
+            const typical = heights[Math.floor(heights.length * 0.75)];
+            // ごく狭い隙間で分かれた行はつなぐ（カンマの下など）
+            const merged = [runs[0].slice()];
+            for (let i = 1; i < runs.length; i++) {
+                const last = merged[merged.length - 1];
+                if (runs[i][0] - last[1] <= typical * 0.15 && runs[i][1] - last[0] <= typical * 1.4) last[1] = runs[i][1];
+                else merged.push(runs[i].slice());
+            }
+            return merged.filter(r => r[1] - r[0] >= typical * 0.35 && r[1] - r[0] <= typical * 2.2)
+                .map(r => ({ y0: r[0], y1: r[1], y: (r[0] + r[1]) / 2 }));
+        }
+
+        // 1行分の範囲から、右寄せの数字の塊（グループ）を文字ごとに切り出す。groups は左から順
+        function segmentLine(gray, w, h, x0, x1, y0, y1) {
+            const b = binarize(gray, w, h, x0, y0, x1, y1);
+            if (!b) return null;
+            const { ink, rw, rh } = b;
+            let top = rh, bottom = -1;
+            for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) if (ink[y * rw + x]) { if (y < top) top = y; if (y > bottom) bottom = y; }
+            if (bottom < 0) return null;
+            const colInk = new Array(rw).fill(0);
+            for (let x = 0; x < rw; x++) for (let y = top; y <= bottom; y++) colInk[x] += ink[y * rw + x];
+            const runs = [];
+            let s = -1;
+            for (let x = 0; x <= rw; x++) {
+                if (x < rw && colInk[x] > 0) { if (s < 0) s = x; }
+                else if (s >= 0) { runs.push([s, x]); s = -1; }
+            }
+            const glyphs = runs.map(([a, c]) => {
+                let gt = bottom, gb = top;
+                for (let y = top; y <= bottom; y++) for (let x = a; x < c; x++) if (ink[y * rw + x]) { if (y < gt) gt = y; if (y > gb) gb = y; }
+                return { x0: a, x1: c, y0: gt, y1: gb };
+            });
+            // 数字の高さ（背の高い文字の中央値）
+            const tall = glyphs.map(g => g.y1 - g.y0 + 1).sort((a, c) => a - c);
+            const digitH = tall[Math.floor(tall.length * 0.6)] || 1;
+            // 字形の途中に縦の隙間がある数字（5 など）は1文字にまとめる
+            for (let i = glyphs.length - 2; i >= 0; i--) {
+                const a = glyphs[i], c = glyphs[i + 1];
+                if (c.x0 - a.x1 <= 2 && c.x1 - a.x0 <= digitH * 0.62) {
+                    glyphs.splice(i, 2, { x0: a.x0, x1: c.x1, y0: Math.min(a.y0, c.y0), y1: Math.max(a.y1, c.y1) });
+                }
+            }
+            // ゴミ（極端に小さい点）を除く
+            const clean = glyphs.filter(g => (g.y1 - g.y0 + 1) >= digitH * 0.12 || (g.x1 - g.x0) >= digitH * 0.12);
+            // 大きく空いたところで塊に分ける
+            const groups = [];
+            for (const g of clean) {
+                const cur = groups[groups.length - 1];
+                if (cur && g.x0 - cur[cur.length - 1].x1 <= digitH * 1.1) cur.push(g);
+                else groups.push([g]);
+            }
+            // 数字の上端（背の高い文字の上端の中央値）
+            const tops = clean.filter(g => g.y1 - g.y0 + 1 >= digitH * 0.7).map(g => g.y0).sort((a, c) => a - c);
+            const digitTop = tops.length ? tops[Math.floor(tops.length / 2)] : top;
+            return { ink, rw, rh, groups, digitH, digitTop };
+        }
+
+        // ---------- 文字の判定（見本の字形との照合） ----------
+        const GW = 12, GH = 20;
+        function glyphFeatures(seg, g) {
+            const bmp = new Float32Array(GW * GH);
+            const gw = g.x1 - g.x0, gh = g.y1 - g.y0 + 1;
+            for (let y = 0; y < GH; y++) for (let x = 0; x < GW; x++) {
+                const sx0 = g.x0 + x * gw / GW, sx1 = g.x0 + (x + 1) * gw / GW;
+                const sy0 = g.y0 + y * gh / GH, sy1 = g.y0 + (y + 1) * gh / GH;
+                let sum = 0, n = 0;
+                for (let yy = Math.floor(sy0); yy < Math.ceil(sy1); yy++) for (let xx = Math.floor(sx0); xx < Math.ceil(sx1); xx++) { sum += seg.ink[yy * seg.rw + xx]; n++; }
+                bmp[y * GW + x] = n ? sum / n : 0;
+            }
+            return {
+                bmp,
+                relH: gh / seg.digitH,
+                relTop: (g.y0 - seg.digitTop) / seg.digitH,
+            };
+        }
+
+        let TEMPLATES = null;
+        function setTemplates(t) { TEMPLATES = t; }
+
+        function classifyGlyph(f) {
+            let best = null, bestD = Infinity;
+            for (const [ch, t] of Object.entries(TEMPLATES)) {
+                let d = 0;
+                for (let i = 0; i < f.bmp.length; i++) { const e = f.bmp[i] - t.bmp[i]; d += e * e; }
+                d = d / f.bmp.length + 2 * ((f.relH - t.relH) ** 2 + (f.relTop - t.relTop) ** 2);
+                if (d < bestD) { bestD = d; best = ch; }
+            }
+            return { ch: best, d: bestD };
+        }
+
+        function readGroup(seg, group) {
+            let text = '', worst = 0;
+            for (const g of group) {
+                const r = classifyGlyph(glyphFeatures(seg, g));
+                text += r.ch;
+                worst = Math.max(worst, r.d);
+            }
+            return { text, worst };
+        }
+
+        // ---------- 数字の比較 ----------
+        // 取り違えやすい数字の組
+        const CONFUSABLE = {
+            '0': '869', '1': '7', '2': '7', '3': '859', '4': '9',
+            '5': '638', '6': '5803', '7': '12', '8': '6530', '9': '840',
+        };
+        function digitsOf(s) {
+            return (s || '').replace(/[^\d]/g, '');
+        }
+        // 読み取った文字列と値の食い違い（取り違えやすい数字は軽く数える）
+        function distance(obs, value) {
+            const a = digitsOf(obs), b = String(value);
+            const m = a.length, n = b.length;
+            const dp = Array.from({ length: m + 1 }, (_, i) => [i, ...new Array(n).fill(0)]);
+            for (let j = 1; j <= n; j++) dp[0][j] = j;
+            for (let i = 1; i <= m; i++) {
+                for (let j = 1; j <= n; j++) {
+                    const sub = a[i - 1] === b[j - 1] ? 0 : (CONFUSABLE[a[i - 1]] || '').includes(b[j - 1]) ? 0.4 : 1;
+                    dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + sub);
+                }
+            }
+            return dp[m][n];
+        }
+        // 読み取った文字列から、取り違えを1か所直した候補を作る
+        function variants(obs) {
+            const d = digitsOf(obs);
+            if (!d) return [];
+            const out = new Set([parseInt(d, 10)]);
+            for (let i = 0; i < d.length; i++) {
+                for (const c of CONFUSABLE[d[i]] || '') out.add(parseInt(d.slice(0, i) + c + d.slice(i + 1), 10));
+            }
+            if (d.length > 1) {
+                out.add(parseInt(d.slice(1), 10));
+                out.add(parseInt(d.slice(0, -1), 10));
+            }
+            return [...out];
+        }
+
+        // ---------- 日報の種類 ----------
+        // 日本語の手がかりが読めないときは、数字の行の数（売上日報は約30行、ギフト別日報は数行）と
+        // 単価（小数）の有無で判定する
+        function isGiftReport(labelText, dailyItems) {
+            const saysGift = /ギフト別|フト別|ト別日|ギフト名|ト名|コード/.test(labelText);
+            const saysDaily = /客数|単価|支払|内訳|消費税|売上合|料理|リハーサル/.test(labelText);
+            if (saysGift && !saysDaily) return true;
+            if (saysDaily && !saysGift) return false;
+            // 金額の書式（3桁ごとのカンマ）に合う行だけ数える。区切りの「＊＊＊」行などを除くため
+            const numeric = dailyItems.filter(it => /^\d{1,3}(,\d{3})*(\.\d\d)?\)?$/.test(it.text));
+            const hasDecimal = numeric.some(it => /\.\d\d$/.test(it.text));
+            return numeric.length <= 12 && !hasDecimal;
+        }
+
+        // OCR の行（日本語）のうち、y 範囲が最も重なる行の文字を返す
+        function labelAt(labels, y0, y1) {
+            let best = '', bestOv = 0;
+            for (const l of labels) {
+                const ov = Math.min(y1, l.y1) - Math.max(y0, l.y0);
+                if (ov > bestOv) { bestOv = ov; best = l.text; }
+            }
+            return best;
+        }
+
+        // ---------- 売上日報 ----------
+        // 【売上】から【取消】までの行の並び（毎回同じ）
+        const DAILY_ROWS = [
+            { key: 'headSales', words: ['売上】', '【売'], noNumber: true },
+            { key: 'menu', words: ['メニュー', 'ニュー'] },
+            { key: 'surcharge', words: ['割増', '増合'] },
+            { key: 'food', words: ['料理', '理飲', '飲物'] },
+            { key: 'takeout', words: ['テイク', 'アウト'] },
+            { key: 'other', words: ['その他', '他計'] },
+            { key: 'sales', words: ['売上合', '上合計'] },
+            { key: 'salesNormal', words: ['通常'], paren: true },
+            { key: 'salesReduced', words: ['軽減'], paren: true },
+            { key: 'customers', words: ['客数'] },
+            { key: 'unitPrice', words: ['単価'], decimal: true },
+            { key: 'discount', words: [] },
+            { key: 'discountExcess', words: [] },
+            { key: 'discountChange', words: [] },
+            { key: 'discountDone', words: [] },
+            { key: 'discountExcessDone', words: [] },
+            { key: 'discountChangeDone', words: [] },
+            { key: 'rehearsal', words: ['リハーサル', 'ハーサル'] },
+            { key: 'tax', words: ['消費税等', '税等'] },
+            { key: 'taxNormal', words: ['通常'], paren: true },
+            { key: 'taxReduced', words: ['軽減'], paren: true },
+            { key: 'taxDiscount', words: ['値引消費', '引消費'], paren: true },
+            { key: 'localTax', words: ['特地税', '地税'] },
+            { key: 'total', words: ['=合', '＝合'] },
+            { key: 'totalNormal', words: ['通常'], paren: true },
+            { key: 'totalReduced', words: ['軽減'], paren: true },
+            { key: 'headPayment', words: ['支払', '内訳'], noNumber: true },
+            { key: 'cash', words: ['現金'] },
+            { key: 'gift', words: ['+ギ', '十ギ'] },
+            { key: 'giftExcess', words: ['ト過剰', 'ト過'] },
+            { key: 'giftChange', words: ['ト釣銭', 'ト釣'] },
+            { key: 'credit', words: ['掛売', '掛'] },
+            { key: 'headCancel', words: ['取消', '【取'], noNumber: true },
+        ];
+
+        // 数字の行に「上から何行目か」を割り当てる。
+        // 行間隔は一定なので相対位置を求め、項目名・数字の形を手がかりに全体の位置を合わせる
+        function alignDailyRows(items) {
+            if (items.length < 5) return null;
+            const gaps = [];
+            for (let i = 1; i < items.length; i++) gaps.push(items[i].y - items[i - 1].y);
+            const sorted = [...gaps].sort((a, b) => a - b);
+            const median = sorted[Math.floor(sorted.length / 2)];
+            const normal = sorted.filter(g => g > median * 0.6 && g < median * 1.5);
+            const pitch = normal.reduce((s, g) => s + g, 0) / normal.length;
+
+            items[0].rel = 0;
+            for (let i = 1; i < items.length; i++) {
+                items[i].rel = items[i - 1].rel + Math.max(1, Math.round((items[i].y - items[i - 1].y) / pitch));
+            }
+
+            const votes = new Map();
+            for (const it of items) {
+                DAILY_ROWS.forEach((row, t) => {
+                    if (row.noNumber) return;
+                    let s = 0;
+                    for (const word of row.words) if (it.label.includes(word)) { s += 2 + word.length * 0.5; break; }
+                    if (row.decimal && /\d\.\d\d$/.test(it.text)) s += 4;
+                    if (row.paren && /\)$/.test(it.text)) s += 0.7;
+                    if (!row.paren && !/\)$/.test(it.text)) s += 0.1;
+                    if (s > 0) votes.set(t - it.rel, (votes.get(t - it.rel) || 0) + s);
+                });
+            }
+            let offset = null, best = 0;
+            for (const [o, v] of votes) if (v > best) { best = v; offset = o; }
+            if (offset === null) return null;
+
+            const rows = {};
+            for (const it of items) {
+                const t = it.rel + offset;
+                if (t >= 0 && t < DAILY_ROWS.length && !DAILY_ROWS[t].noNumber) rows[DAILY_ROWS[t].key] = it;
+            }
+            return rows;
+        }
+
+        // 検算を使って、読み取った数字の取り違えを直す
+        function solveDailyReport(rows) {
+            const obs = key => (rows[key] && rows[key].text) || null;
+            const read = key => { const d = digitsOf(obs(key)); return d ? parseInt(d, 10) : null; };
+            const memo = new Map();
+            const cost = (key, value) => {
+                if (obs(key) === null || value === null) return 0;
+                const k = key + ':' + value;
+                if (!memo.has(k)) memo.set(k, distance(obs(key), value));
+                return memo.get(k);
+            };
+            const candidatesFrom = (...keys) => {
+                const set = new Set();
+                for (const k of keys) if (obs(k)) variants(obs(k)).forEach(v => set.add(v));
+                return [...set];
+            };
+
+            // 値引・リハーサル・特地税（通常0）は読み取り値をそのまま使う
+            const adjust = -(read('discount') || 0) + (read('discountExcess') || 0) + (read('discountChange') || 0)
+                - (read('rehearsal') || 0) + (read('localTax') || 0);
+
+            // 売上（通常）・売上（軽減）・税（通常）・税（軽減）を決めれば、合計などは計算で決まる。
+            // 同じ値が3行ずつ印字されているので、それぞれ見込みの高い候補に絞る
+            const top = (cands, f, n) => cands.map(c => [c, f(c)]).sort((a, b) => a[1] - b[1]).slice(0, n).map(e => e[0]);
+            const sNormalC = top(candidatesFrom('menu', 'food', 'salesNormal'), sn => cost('menu', sn) + cost('food', sn) + cost('salesNormal', sn), 8);
+            const sReducedC = top(candidatesFrom('takeout', 'other', 'salesReduced'), sr => cost('takeout', sr) + cost('other', sr) + cost('salesReduced', sr), 8);
+            const xNormalC = candidatesFrom('taxNormal');
+            const xReducedC = candidatesFrom('taxReduced');
+            // 税は合計（通常/軽減）との差からも候補を作る
+            for (const tn of candidatesFrom('totalNormal')) for (const sn of sNormalC) if (tn > sn) xNormalC.push(tn - sn);
+            for (const tr of candidatesFrom('totalReduced')) for (const sr of sReducedC) if (tr > sr) xReducedC.push(tr - sr);
+
+            const salesCost = (sn, sr) => cost('menu', sn) + cost('food', sn) + cost('salesNormal', sn)
+                + cost('takeout', sr) + cost('other', sr) + cost('salesReduced', sr) + cost('sales', sn + sr);
+            const salesPairs = [];
+            for (const sn of sNormalC) for (const sr of sReducedC) salesPairs.push([sn, sr, salesCost(sn, sr)]);
+            salesPairs.sort((a, b) => a[2] - b[2]);
+            const xnList = [...new Set(xNormalC)], xrList = [...new Set(xReducedC)];
+            let best = null, bestCost = Infinity;
+            for (const [sn, sr, sc] of salesPairs) {
+                for (const xn of xnList) {
+                    const cn = cost('taxNormal', xn) + cost('totalNormal', sn + xn);
+                    for (const xr of xrList) {
+                        const c = sc + cn + cost('taxReduced', xr) + cost('totalReduced', sr + xr)
+                            + cost('tax', xn + xr) + cost('total', sn + sr + xn + xr + adjust);
+                        if (c < bestCost) { bestCost = c; best = { sn, sr, xn, xr }; }
+                    }
+                }
+            }
+
+            const v = {};
+            if (best) {
+                v.sales = best.sn + best.sr;
+                v.tax = best.xn + best.xr;
+                v.total = v.sales + v.tax + adjust;
+                v.salesNormal = best.sn;
+                v.salesReduced = best.sr;
+            } else {
+                v.sales = read('sales');
+                v.tax = read('tax');
+                v.total = read('total');
+            }
+
+            // 客数: 単価 = 売上合計 ÷ 客数（小数第3位以下切り捨て）を満たす客数を探す
+            const unitObs = /\d\.\d\d$/.test(obs('unitPrice') || '') ? obs('unitPrice') : null;
+            if (v.sales && (unitObs || obs('customers'))) {
+                let bn = null, bc = Infinity;
+                for (let n = 1; n <= 3000; n++) {
+                    const c = cost('customers', n) * 1.5 + (unitObs ? Math.min(distance(unitObs, Math.floor(v.sales * 100 / n)), 3) : 0);
+                    if (c < bc) { bc = c; bn = n; }
+                }
+                v.customers = bn;
+            } else {
+                v.customers = read('customers');
+            }
+
+            // 支払内訳: 合計 = 現金 + ギフト − ギフト過剰 − ギフト釣銭 + 掛売
+            v.giftExcess = read('giftExcess') || 0;
+            v.change = read('giftChange') || 0;
+            const cashC = candidatesFrom('cash'), giftC = candidatesFrom('gift'), creditC = candidatesFrom('credit');
+            if (v.total !== null) {
+                let bp = null, bpc = Infinity;
+                const pay = (c, g, k) => cost('cash', c) + cost('gift', g) + cost('credit', k);
+                const fixed = v.total + v.giftExcess + v.change;
+                const tryPay = (c, g, k) => { if (c >= 0 && g >= 0 && k >= 0) { const s = pay(c, g, k); if (s < bpc) { bpc = s; bp = [c, g, k]; } } };
+                // 3つのうち2つを候補から選び、残り1つは合計から逆算
+                for (const c of cashC) for (const g of giftC) tryPay(c, g, fixed - c - g);
+                for (const c of cashC) for (const k of creditC) tryPay(c, fixed - c - k, k);
+                for (const g of giftC) for (const k of creditC) tryPay(fixed - g - k, g, k);
+                if (bp) [v.cash, v.gift, v.credit] = bp;
+            }
+            if (v.cash === undefined) { v.cash = read('cash'); v.gift = read('gift'); v.credit = read('credit'); }
+
+            // 読み取れなかった行・読み取り値を検算で直した行
+            const derived = {
+                sales: v.sales, tax: v.tax, total: v.total, customers: v.customers,
+                cash: v.cash, gift: v.gift, credit: v.credit,
+                salesNormal: v.salesNormal, salesReduced: v.salesReduced,
+            };
+            const missing = [], corrected = [];
+            for (const [key, value] of Object.entries(derived)) {
+                if (value === null || value === undefined) continue;
+                if (obs(key) === null) missing.push(key);
+                else if (digitsOf(obs(key)) !== String(value)) corrected.push({ key, read: obs(key), value });
+            }
+            const checks = [];
+            if (unitObs && v.sales && v.customers) {
+                checks.push({ label: '売上合計 ÷ レジ客数 = レジ単価', ok: digitsOf(unitObs) === String(Math.floor(v.sales * 100 / v.customers)) });
+            }
+            if (v.sales !== null && v.tax !== null && v.total !== null) {
+                checks.push({ label: '売上合計 + 消費税等 = ＊＝合計', ok: ['sales', 'tax', 'total'].every(k => obs(k) !== null && digitsOf(obs(k)) === String(v[k])) });
+            }
+            if (v.cash !== null && v.gift !== null && v.credit !== null) {
+                checks.push({ label: '現金 + ギフト + 掛売 = ＊＝合計', ok: ['cash', 'gift', 'credit'].every(k => obs(k) !== null && digitsOf(obs(k)) === String(v[k])) });
+            }
+            // 検算でも辻褄が合わない（読み取り値から大きく直した）ときは信頼できない
+            const unreliable = bestCost > 3 || corrected.some(c => distance(c.read, c.value) > 1.5);
+            return { values: v, missing, corrected, checks, residual: bestCost, unreliable };
+        }
+
+        // ---------- ギフト別日報 ----------
+        // ギフト名 → 入力欄。上から順に判定する（読み取りやすい文字を手がかりにする）
+        const GIFT_TYPES = [
+            { name: '指定ギフト券 釣銭無', amount: 'inputP', test: t => /指定|定ギ/.test(t) },
+            { name: 'ACS値引券 釣銭無', amount: 'inputI', test: t => /ACS|AC|値引|引券/.test(t) },
+            { name: 'WAONポイント', amount: 'inputJ', test: t => /WAON|WA|ポイント|イント/.test(t) },
+            { name: 'グルメカード', amount: 'inputL', test: t => /グルメ|ルメ|カード/.test(t) },
+            { name: 'SC500円券', amount: 'inputM', test: t => /500|円券/.test(t) },
+            { name: 'RHG共通商品券', amount: 'inputN', test: t => /RHG|RH|共通/.test(t) },
+            { name: 'SC割引券', amount: 'inputO', test: t => /割引|割/.test(t) },
+            { name: 'SC商品券', amount: 'inputH', test: t => /商品|品券/.test(t) },
+            { name: 'SCギフト 釣銭無', amount: 'inputD', count: 'inputE', test: t => /無|釣|銭/.test(t) },
+            { name: 'SCギフト', amount: 'inputF', count: 'inputG', test: t => /ギ|フト/.test(t) },
+        ];
+
+        // 数字の行（items）から「件数 金額」の組を取り出す。ギフト名は同じ行かその上の行
+        function extractGiftPairs(items, labels) {
+            const header = labels.find(l => /ギフト名|ト名|件数|コード/.test(l.text));
+            const pairs = [];
+            for (const it of items) {
+                if (header && it.y0 < header.y1) continue;
+                if (it.groups.length < 2) continue;
+                const [c, a] = it.groups.slice(-2);
+                if (!/^\d{1,4}$/.test(c) || !/^\d{1,3}(,\d{3})*$/.test(a)) continue;
+                if (parseInt(digitsOf(a), 10) < parseInt(c, 10)) continue; // 金額は件数以上
+                const above = labels.filter(l => l.y1 <= it.y0 + 5).sort((x, y) => y.y1 - x.y1)[0];
+                pairs.push({ y: it.y, count: parseInt(c, 10), amount: parseInt(digitsOf(a), 10), name: (above ? above.text : '') + it.label });
+            }
+            return pairs;
+        }
+
+        // pairs: [{ y, count, amount, name }] を上から順に
+        function solveGiftReport(pairs) {
+            if (!pairs.length) return { entries: [], total: null, checks: [] };
+            // 最後の「件数 金額」行が ■合計■
+            const total = pairs.length >= 2 ? pairs[pairs.length - 1] : null;
+            const entries = (total ? pairs.slice(0, -1) : pairs).map(p => ({
+                type: GIFT_TYPES.find(g => g.test(p.name.replace(/^.{0,2}\d+[:：]/, ''))) || null,
+                name: p.name, count: p.count, amount: p.amount,
+            }));
+            const checks = [];
+            if (total) {
+                const sumA = entries.reduce((s, e) => s + e.amount, 0);
+                const sumC = entries.reduce((s, e) => s + e.count, 0);
+                checks.push({ label: 'ギフトごとの金額の合計 = ■合計■', ok: sumA === total.amount });
+                checks.push({ label: 'ギフトごとの件数の合計 = ■合計■', ok: sumC === total.count });
+            }
+            return { entries, total, checks };
+        }
+
+        return {
+            findPaperColumns, estimateSkew, findNumberLines, segmentLine, readGroup, setTemplates,
+            isGiftReport, labelAt, alignDailyRows, solveDailyReport, extractGiftPairs, solveGiftReport,
+            glyphFeatures, classifyGlyph, distance, variants, digitsOf, GIFT_TYPES, DAILY_ROWS, GW, GH,
+        };
+    })();
+
+    // 数字の見本の字形（実物の売上日報の写真から作成）。各文字 12×20 の濃さ（0〜1）と、高さ・上端の位置
+    const DIGIT_TEMPLATES = {
+        ")": { relH: 1.234, relTop: -0.101, bmp: [0.82,0.98,0.92,0.69,0.32,0.06,0,0,0,0,0,0,0.65,0.9,0.99,1,0.94,0.72,0.36,0.1,0,0,0,0,0.09,0.3,0.73,1,1,1,0.94,0.58,0.11,0,0,0,0,0,0.11,0.59,0.94,1,1,0.97,0.66,0.15,0,0,0,0,0,0.04,0.45,0.89,1,1,1,0.54,0.04,0,0,0,0,0,0.05,0.45,0.96,1,1,0.81,0.36,0.11,0,0,0,0,0,0.12,0.65,0.95,1,0.99,0.93,0.61,0,0,0,0,0,0,0.09,0.58,0.98,1,0.98,0.7,0,0,0,0,0,0,0,0.31,0.95,1,0.99,0.78,0,0,0,0,0,0,0,0.28,0.94,1,1,0.88,0,0,0,0,0,0,0,0.27,0.92,1,1,0.9,0,0,0,0,0,0,0,0.25,0.9,1,1,0.87,0,0,0,0,0,0,0.03,0.39,0.94,1,1,0.89,0,0,0,0,0,0.02,0.45,0.89,1,1,0.99,0.84,0,0,0,0,0,0.08,0.69,1,1,0.97,0.68,0.28,0,0,0,0,0.21,0.67,0.96,1,1,0.86,0.28,0,0,0,0.01,0.24,0.76,1,1,1,0.99,0.52,0.04,0,0.06,0.2,0.5,0.87,0.99,1,1,0.91,0.56,0.11,0,0,0.45,0.82,0.98,1,0.99,0.95,0.78,0.39,0.05,0,0,0,0.38,0.69,0.92,0.9,0.62,0.33,0.12,0.01,0,0,0,0] },
+        ",": { relH: 0.337, relTop: 0.806, bmp: [0.26,0.38,0.57,0.73,0.72,0.7,0.67,0.67,0.68,0.53,0.27,0.09,0.4,0.57,0.78,0.87,0.87,0.86,0.85,0.86,0.85,0.74,0.47,0.28,0.71,0.85,0.98,0.99,0.99,0.99,0.99,1,1,0.97,0.77,0.56,0.88,0.95,0.99,1,1,1,1,1,1,1,0.9,0.73,0.9,0.96,1,1,1,1,1,1,1,1,0.95,0.87,0.84,0.95,1,1,1,1,1,1,1,1,0.96,0.89,0.79,0.94,1,1,1,1,1,1,1,1,0.97,0.89,0.69,0.89,1,1,1,1,1,1,1,1,0.98,0.91,0.5,0.76,0.96,0.99,1,1,1,1,1,1,0.98,0.95,0.26,0.57,0.89,0.97,1,1,1,1,1,1,0.98,0.96,0.02,0.2,0.61,0.9,0.96,1,1,1,1,1,0.97,0.93,0,0.1,0.48,0.85,0.95,0.99,1,1,1,0.99,0.91,0.8,0,0.1,0.48,0.85,0.97,0.99,1,1,1,0.94,0.68,0.46,0.03,0.21,0.6,0.9,0.99,1,1,1,0.99,0.82,0.39,0.14,0.19,0.44,0.77,0.96,1,1,1,1,0.97,0.64,0.18,0.02,0.35,0.66,0.95,1,1,1,1,0.98,0.76,0.29,0.03,0,0.44,0.74,0.98,1,1,1,0.98,0.79,0.37,0.05,0,0,0.44,0.75,0.97,0.99,0.98,0.96,0.78,0.4,0.11,0.01,0,0,0.28,0.57,0.88,0.94,0.87,0.7,0.37,0.12,0.02,0,0,0,0.17,0.4,0.78,0.89,0.76,0.45,0.12,0.04,0.01,0,0,0] },
+        ".": { relH: 0.252, relTop: 0.8, bmp: [0.33,0.33,0.5,0.67,0.67,0.83,1,1,0.83,0.5,0.17,0,0.33,0.5,0.75,0.83,0.83,0.92,1,1,0.92,0.67,0.33,0.17,0.5,0.75,1,1,1,1,1,1,1,0.83,0.5,0.33,0.83,0.92,1,1,1,1,1,1,1,0.83,0.58,0.5,1,1,1,1,1,1,1,1,1,0.92,0.75,0.67,1,1,1,1,1,1,1,1,1,1,0.92,0.83,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0.92,0.83,1,1,1,1,1,1,1,1,1,1,0.83,0.67,0.67,0.83,1,1,1,1,1,1,1,1,0.75,0.5,0.33,0.67,1,1,1,1,1,1,1,0.83,0.5,0.33,0.33,0.67,1,1,1,1,1,1,1,0.67,0.25,0.17,0.17,0.42,0.83,1,1,0.92,0.83,0.83,0.67,0.33,0.08,0,0,0.17,0.67,1,1,0.83,0.67,0.67,0.33,0,0,0] },
+        "0": { relH: 0.98, relTop: 0.005, bmp: [0,0,0.03,0.43,0.88,0.89,0.9,0.85,0.25,0,0,0,0,0.09,0.48,0.91,1,0.99,0.99,1,0.78,0.32,0.05,0,0.04,0.54,0.95,1,0.89,0.59,0.63,0.92,0.94,0.88,0.41,0.01,0.11,0.76,1,0.94,0.36,0.03,0.06,0.45,0.92,0.99,0.63,0.03,0.25,0.87,1,0.72,0.02,0,0,0.08,0.83,0.98,0.81,0.17,0.7,0.99,1,0.59,0,0,0,0.01,0.65,0.97,0.99,0.63,0.94,1,0.94,0.32,0,0,0,0,0.37,0.94,1,0.86,0.95,1,0.65,0.04,0,0,0,0,0.08,0.73,1,0.9,0.93,1,0.51,0,0,0,0,0,0,0.58,1,0.91,0.93,1,0.49,0,0,0,0,0,0,0.55,1,0.91,0.92,1,0.48,0,0,0,0,0,0,0.52,1,0.92,0.93,1,0.48,0,0,0,0,0,0,0.52,1,0.94,0.93,1,0.65,0.05,0,0,0,0,0.04,0.62,1,0.96,0.87,1,0.95,0.38,0,0,0,0,0.32,0.9,1,0.94,0.64,1,1,0.63,0,0,0,0,0.52,0.98,1,0.71,0.3,0.93,1,0.79,0.04,0,0,0.01,0.63,0.98,0.96,0.37,0.12,0.75,1,0.98,0.5,0.1,0.08,0.39,0.88,0.98,0.87,0.21,0.03,0.5,0.96,1,0.95,0.74,0.72,0.92,0.95,0.97,0.64,0.07,0,0.11,0.55,0.93,1,0.99,1,1,0.92,0.62,0.18,0,0,0,0.07,0.45,0.85,0.8,0.78,0.86,0.54,0.11,0,0] },
+        "1": { relH: 0.985, relTop: 0.004, bmp: [0,0,0,0.12,0.62,0.94,0.85,0.35,0,0,0,0,0.09,0.16,0.36,0.73,0.98,1,1,0.48,0,0,0,0,0.72,0.86,0.96,1,1,1,0.99,0.45,0,0,0,0,0.85,0.99,1,1,1,1,0.99,0.43,0,0,0,0,0.18,0.44,0.53,0.67,0.96,1,0.99,0.47,0,0,0,0,0,0,0,0.07,0.71,1,1,0.49,0,0,0,0,0,0,0,0.01,0.62,1,1,0.5,0,0,0,0,0,0,0,0,0.59,1,1,0.51,0,0,0,0,0,0,0,0,0.55,1,1,0.51,0,0,0,0,0,0,0,0,0.54,1,1,0.52,0,0,0,0,0,0,0,0,0.54,1,1,0.53,0,0,0,0,0,0,0,0,0.53,1,1,0.52,0,0,0,0,0,0,0,0,0.54,1,1,0.56,0,0,0,0,0,0,0,0,0.52,1,1,0.59,0,0,0,0,0,0,0,0,0.51,1,1,0.58,0,0,0,0,0,0,0,0,0.49,0.99,1,0.58,0,0,0,0,0.07,0.14,0.2,0.24,0.7,1,1,0.82,0.25,0.11,0.12,0.08,0.51,0.77,0.83,0.89,0.99,1,1,1,0.85,0.73,0.8,0.68,0.63,0.93,0.99,1,1,1,1,1,0.91,0.86,0.93,0.81,0.16,0.43,0.57,0.6,0.76,0.91,0.92,0.75,0.5,0.4,0.37,0.22] },
+        "2": { relH: 1.008, relTop: -0.002, bmp: [0,0.05,0.44,0.85,0.87,0.82,0.83,0.85,0.68,0.29,0.03,0,0.11,0.53,0.93,1,1,1,1,0.98,0.86,0.85,0.44,0.06,0.65,0.98,1,0.89,0.56,0.53,0.51,0.47,0.75,0.97,0.95,0.55,0.91,1,0.9,0.36,0.01,0.01,0.01,0.01,0.34,0.89,1,0.82,0.93,1,0.58,0.01,0,0,0,0,0.06,0.72,1,0.81,0.89,1,0.5,0,0,0,0,0,0.11,0.78,1,0.82,0.5,0.66,0.25,0,0,0,0,0,0.44,0.94,1,0.77,0.05,0.08,0.01,0,0,0,0,0.08,0.69,0.97,0.97,0.49,0,0,0,0,0,0,0.12,0.61,0.85,0.96,0.73,0.11,0,0,0,0,0,0.13,0.67,0.98,0.86,0.84,0.33,0.01,0,0,0,0.01,0.29,0.79,1,0.97,0.65,0.19,0.01,0,0,0,0.02,0.34,0.88,1,0.99,0.73,0.14,0,0,0,0,0,0.23,0.89,1,0.94,0.57,0.12,0,0,0,0,0,0.04,0.53,0.98,0.96,0.55,0.07,0,0,0,0,0,0,0.3,0.88,1,0.73,0.12,0,0,0,0,0,0,0.13,0.71,0.99,0.98,0.34,0,0,0,0,0,0,0,0.58,0.97,1,0.96,0.4,0.19,0.16,0.13,0.11,0.13,0.16,0.11,0.75,1,1,1,0.95,0.88,0.85,0.84,0.72,0.78,0.84,0.73,0.71,0.99,1,0.99,0.99,0.99,0.99,0.99,0.88,0.92,0.97,0.85,0.4,0.79,0.86,0.81,0.71,0.63,0.59,0.61,0.5,0.51,0.51,0.28] },
+        "3": { relH: 0.981, relTop: -0.004, bmp: [0,0.05,0.47,0.86,0.9,0.91,0.9,0.86,0.65,0.33,0.05,0,0.15,0.58,0.92,1,0.99,0.99,0.99,0.99,0.85,0.85,0.56,0.12,0.72,0.99,1,0.91,0.54,0.46,0.47,0.5,0.71,0.94,0.97,0.66,0.94,1,0.9,0.39,0.02,0,0,0.01,0.3,0.83,1,0.88,0.91,0.99,0.56,0.02,0,0,0,0,0.02,0.61,1,0.91,0.46,0.6,0.2,0,0,0,0,0,0.04,0.66,1,0.92,0.02,0.04,0.01,0,0,0,0,0.02,0.38,0.89,1,0.9,0,0,0.01,0.05,0.03,0.01,0.1,0.44,0.77,0.95,0.97,0.6,0,0,0.33,0.73,0.67,0.65,0.77,0.95,0.83,0.88,0.56,0.11,0,0,0.5,1,1,0.99,0.99,1,0.81,0.77,0.26,0,0,0,0.16,0.5,0.48,0.47,0.52,0.85,0.82,0.91,0.7,0.15,0,0,0,0,0,0,0.02,0.31,0.74,0.93,0.98,0.64,0,0,0,0,0,0,0,0.01,0.38,0.87,1,0.91,0.03,0.03,0.01,0,0,0,0,0,0.05,0.63,1,0.94,0.53,0.59,0.21,0,0,0,0,0,0,0.55,1,0.94,0.89,0.99,0.61,0.05,0,0,0,0,0.02,0.61,1,0.96,0.84,1,0.92,0.54,0.06,0.03,0.04,0.06,0.37,0.86,1,0.96,0.54,0.96,1,0.97,0.7,0.66,0.68,0.68,0.76,0.93,1,0.76,0.11,0.59,0.95,1,1,0.99,0.97,0.99,0.87,0.91,0.79,0.29,0,0.11,0.55,0.88,0.81,0.74,0.76,0.81,0.74,0.58,0.21,0.01] },
+        "4": { relH: 1, relTop: 0.004, bmp: [0,0,0,0,0,0.03,0.45,0.83,0.76,0.35,0,0,0,0,0,0,0.01,0.38,0.92,0.99,0.91,0.47,0.01,0,0,0,0,0,0.13,0.76,1,1,0.9,0.47,0.01,0,0,0,0,0,0.44,0.98,1,1,0.91,0.47,0,0,0,0,0,0.06,0.75,1,0.93,0.91,0.94,0.48,0,0,0,0,0.01,0.43,0.97,0.98,0.56,0.56,0.93,0.48,0.01,0,0,0,0.11,0.8,1,0.82,0.16,0.41,0.94,0.49,0.01,0,0,0,0.42,0.99,0.98,0.47,0,0.4,0.95,0.49,0.01,0,0,0.09,0.75,1,0.77,0.11,0,0.39,0.94,0.48,0.01,0,0,0.43,0.95,1,0.44,0,0,0.39,0.94,0.47,0.01,0,0.25,0.88,1,0.74,0.08,0,0,0.36,0.95,0.5,0,0,0.68,1,0.94,0.35,0,0,0,0.35,0.95,0.52,0.01,0,0.96,1,0.91,0.42,0.2,0.17,0.12,0.53,0.95,0.64,0.23,0.08,0.97,1,0.99,0.92,0.87,0.82,0.79,0.91,0.94,0.81,0.84,0.69,0.89,0.99,0.98,0.98,0.98,0.97,0.97,0.99,0.92,0.86,0.98,0.85,0.45,0.63,0.58,0.55,0.5,0.44,0.43,0.78,0.95,0.83,0.56,0.28,0.05,0.07,0.04,0.03,0.03,0.01,0.01,0.46,0.99,0.73,0.08,0.01,0,0,0,0,0,0,0,0.42,0.99,0.72,0.07,0,0,0,0,0,0,0,0,0.38,0.97,0.65,0.03,0,0,0,0,0,0,0,0,0.2,0.8,0.43,0.01,0] },
+        "5": { relH: 0.997, relTop: 0.005, bmp: [0.57,0.79,0.8,0.8,0.77,0.79,0.8,0.8,0.68,0.75,0.88,0.67,0.9,1,1,1,1,1,1,0.98,0.85,0.95,0.99,0.83,0.93,1,0.91,0.6,0.45,0.47,0.5,0.5,0.42,0.49,0.53,0.34,0.92,1,0.64,0.04,0,0,0,0,0.01,0.01,0,0,0.92,1,0.55,0,0,0,0,0,0,0,0,0,0.93,1,0.53,0,0,0,0,0,0,0,0,0,0.92,1,0.51,0,0.01,0.02,0.03,0.02,0.01,0,0,0,0.9,1,0.63,0.18,0.6,0.65,0.66,0.63,0.49,0.26,0.02,0,0.87,1,0.96,0.89,1,1,1,0.99,0.81,0.8,0.45,0.07,0.85,1,1,0.97,0.67,0.58,0.57,0.57,0.75,0.94,0.94,0.5,0.84,1,0.91,0.44,0.01,0,0,0,0.25,0.81,1,0.84,0.58,0.81,0.42,0.04,0,0,0,0,0.02,0.5,1,0.91,0.08,0.16,0.03,0,0,0,0,0,0,0.42,0.99,0.94,0.06,0.09,0.01,0,0,0,0,0,0,0.43,0.99,0.97,0.56,0.72,0.28,0,0,0,0,0,0,0.43,0.99,0.96,0.85,1,0.65,0.05,0,0,0,0,0.01,0.49,1,0.96,0.81,1,0.93,0.48,0.04,0.01,0.02,0.02,0.29,0.8,1,0.93,0.57,0.97,1,0.97,0.69,0.62,0.61,0.6,0.74,0.93,1,0.77,0.13,0.63,0.95,1,1,1,1,1,0.91,0.95,0.8,0.28,0.01,0.15,0.57,0.86,0.87,0.87,0.83,0.8,0.72,0.62,0.24,0.01] },
+        "6": { relH: 0.997, relTop: -0.002, bmp: [0,0.02,0.43,0.83,0.82,0.81,0.85,0.83,0.59,0.28,0.03,0,0.09,0.5,0.9,1,0.99,1,0.99,0.98,0.75,0.8,0.52,0.11,0.66,0.99,1,0.89,0.52,0.49,0.49,0.5,0.63,0.92,0.98,0.62,0.93,1,0.91,0.36,0.02,0,0,0.01,0.29,0.82,1,0.77,0.93,1,0.61,0.01,0,0,0,0,0.01,0.33,0.61,0.33,0.92,1,0.5,0,0,0,0,0,0,0,0.01,0,0.89,1,0.46,0,0.04,0.06,0.07,0.06,0.03,0.01,0,0,0.87,1,0.61,0.26,0.65,0.74,0.73,0.69,0.49,0.23,0.02,0,0.84,1,0.96,0.92,0.99,0.99,0.98,0.98,0.74,0.76,0.48,0.06,0.82,1,1,0.87,0.58,0.53,0.51,0.5,0.58,0.85,0.93,0.5,0.81,1,0.87,0.26,0.01,0,0,0,0.17,0.73,1,0.84,0.82,1,0.66,0.01,0,0,0,0,0.01,0.54,1,0.89,0.83,1,0.61,0,0,0,0,0,0,0.45,0.99,0.91,0.84,1,0.59,0,0,0,0,0,0,0.44,0.99,0.91,0.84,1,0.59,0,0,0,0,0,0,0.44,0.99,0.94,0.84,1,0.7,0.05,0,0,0,0,0.01,0.5,1,0.96,0.82,1,0.94,0.5,0.07,0.04,0.05,0.05,0.26,0.78,1,0.94,0.57,0.97,1,0.94,0.68,0.65,0.66,0.65,0.66,0.87,1,0.77,0.13,0.61,0.96,1,1,1,0.99,0.98,0.77,0.85,0.78,0.29,0,0.11,0.61,0.89,0.8,0.78,0.78,0.72,0.59,0.5,0.22,0.02] },
+        "7": { relH: 1.001, relTop: -0.001, bmp: [0.71,0.8,0.8,0.83,0.8,0.78,0.8,0.81,0.72,0.76,0.78,0.56,0.93,1,1,0.99,1,0.99,0.98,0.99,0.9,0.96,1,0.95,0.45,0.65,0.62,0.56,0.6,0.55,0.47,0.43,0.67,0.95,1,0.94,0.02,0.04,0.04,0.02,0.02,0.02,0,0,0.52,0.97,1,0.87,0,0,0,0,0,0,0,0.04,0.7,0.99,1,0.58,0,0,0,0,0,0,0,0.37,0.88,1,0.84,0.18,0,0,0,0,0,0,0.13,0.76,0.9,0.94,0.44,0,0,0,0,0,0,0.04,0.57,0.98,0.9,0.62,0.1,0,0,0,0,0,0,0.07,0.74,1,0.81,0.26,0.01,0,0,0,0,0,0,0.21,0.83,1,0.57,0.03,0,0,0,0,0,0,0.12,0.71,0.99,0.99,0.35,0,0,0,0,0,0,0,0.24,0.89,1,0.93,0.11,0,0,0,0,0,0,0,0.44,0.95,1,0.68,0,0,0,0,0,0,0,0.09,0.84,1,0.96,0.42,0,0,0,0,0,0,0,0.21,0.97,1,0.76,0.15,0,0,0,0,0,0,0,0.26,0.99,0.99,0.43,0.01,0,0,0,0,0,0,0,0.29,1,0.98,0.34,0,0,0,0,0,0,0,0,0.29,0.98,0.98,0.37,0,0,0,0,0,0,0,0,0.23,0.96,0.95,0.33,0,0,0,0,0,0,0,0,0.06,0.75,0.75,0.13,0,0,0,0,0] },
+        "8": { relH: 0.996, relTop: -0.006, bmp: [0,0,0.18,0.78,0.86,0.79,0.8,0.82,0.35,0.02,0,0,0,0.11,0.68,0.99,1,0.98,0.97,0.99,0.72,0.23,0.02,0,0.15,0.7,0.99,0.99,0.72,0.49,0.5,0.82,0.78,0.68,0.33,0,0.29,0.93,0.98,0.62,0.12,0,0.01,0.25,0.53,0.84,0.6,0.02,0.26,0.9,0.93,0.23,0,0,0,0,0.27,0.83,0.69,0.03,0.23,0.88,0.96,0.32,0,0,0,0.02,0.28,0.82,0.69,0.02,0.23,0.87,1,0.8,0.16,0,0.01,0.29,0.54,0.82,0.69,0.03,0.07,0.6,0.99,1,0.68,0.18,0.32,0.84,0.76,0.69,0.38,0.01,0,0.15,0.85,1,1,0.87,0.9,1,0.72,0.35,0.02,0,0,0.09,0.77,1,1,0.99,0.99,1,0.76,0.33,0.02,0,0.1,0.65,0.99,0.99,0.78,0.52,0.51,0.83,0.74,0.72,0.57,0.07,0.6,0.95,0.99,0.78,0.22,0,0.01,0.29,0.53,0.72,0.97,0.55,0.94,1,0.75,0.18,0,0,0,0.01,0.15,0.6,1,0.88,0.93,0.99,0.38,0,0,0,0,0,0,0.37,1,0.91,0.92,0.97,0.29,0,0,0,0,0,0,0.34,1,0.95,0.95,0.96,0.35,0,0,0,0,0,0,0.37,1,0.95,0.94,1,0.81,0.21,0.02,0.02,0.02,0.01,0.12,0.59,1,0.95,0.81,0.99,1,0.78,0.59,0.59,0.62,0.61,0.53,0.74,1,0.76,0.34,0.8,0.98,1,1,1,1,0.99,0.84,0.75,0.8,0.26,0.02,0.26,0.78,0.87,0.82,0.83,0.83,0.8,0.6,0.48,0.22,0.01] },
+        "9": { relH: 0.993, relTop: 0.004, bmp: [0,0.08,0.5,0.83,0.85,0.89,0.92,0.9,0.76,0.33,0.04,0,0.13,0.59,0.95,1,0.96,0.97,0.98,0.99,0.94,0.88,0.49,0.1,0.67,0.97,1,0.91,0.42,0.38,0.43,0.54,0.9,0.99,0.96,0.58,0.93,1,0.91,0.42,0.01,0,0,0.03,0.46,0.9,1,0.8,0.94,1,0.58,0.02,0,0,0,0,0.03,0.66,1,0.83,0.95,1,0.47,0,0,0,0,0,0,0.59,1,0.83,0.96,1,0.48,0,0,0,0,0,0,0.58,1,0.83,0.95,1,0.47,0,0,0,0,0,0,0.55,1,0.81,0.94,1,0.54,0.01,0,0,0,0,0.02,0.56,1,0.82,0.89,1,0.91,0.4,0.02,0.01,0.01,0.02,0.4,0.85,1,0.83,0.52,0.95,1,0.96,0.73,0.7,0.71,0.73,0.87,0.95,1,0.85,0.07,0.51,0.93,1,0.97,0.98,0.98,0.97,0.72,0.86,1,0.89,0,0.05,0.39,0.6,0.49,0.46,0.44,0.39,0.13,0.58,1,0.91,0,0,0,0.02,0,0,0,0,0,0.5,1,0.93,0.07,0.07,0,0,0,0,0,0,0,0.49,1,0.94,0.63,0.76,0.43,0.05,0,0,0,0,0.03,0.59,1,0.97,0.8,1,0.95,0.61,0.14,0.09,0.09,0.09,0.45,0.91,1,0.94,0.48,0.95,1,0.98,0.83,0.76,0.73,0.75,0.89,0.97,1,0.72,0.08,0.52,0.92,1,1,1,1,1,0.95,0.94,0.75,0.23,0,0.06,0.44,0.81,0.77,0.75,0.78,0.77,0.67,0.55,0.2,0.01] }
+    };
+    </script>
     <script>
         document.addEventListener('DOMContentLoaded', () => {
             const calculateBtn = document.getElementById('calculateBtn');
@@ -495,256 +1090,40 @@
             });
             calculateSettlement();
 
-            // ===== 売上日報の撮影・読み取り =====
+            // ===== 日報の撮影・読み取り =====
+            // 数字はレシートの印字フォント専用の照合で読み、日本語の OCR は行の位置合わせと
+            // 日報の種類の判定にだけ使う
             const receiptInput = document.getElementById('receiptInput');
             const cameraButton = document.getElementById('cameraButton');
             const ocrPreview = document.getElementById('ocrPreview');
             const ocrStatus = document.getElementById('ocrStatus');
-            const ocrChecks = document.getElementById('ocrChecks');
+            const ocrResult = document.getElementById('ocrResult');
             const ocrRawWrap = document.getElementById('ocrRawWrap');
             const ocrRaw = document.getElementById('ocrRaw');
 
-            // 読み取り結果 → 入力欄
-            const OCR_FIELDS = {
-                total: 'inputA',
-                customers: 'inputB',
-                cash: 'inputC',
-                credit: 'inputK',
-                change: 'inputQ',
-                tax: 'inputR',
+            const OCR_WIDTH = 1200; // 補正後のレシートの幅（px）
+            ReceiptCore.setTemplates(DIGIT_TEMPLATES);
+
+            // 売上日報の読み取り結果 → 入力欄
+            const DAILY_FIELDS = [
+                { key: 'total', id: 'inputA', label: '①＊＝合計' },
+                { key: 'customers', id: 'inputB', label: '②レジ客数' },
+                { key: 'cash', id: 'inputC', label: '③+現金' },
+                { key: 'credit', id: 'inputK', label: '④+掛売' },
+                { key: 'change', id: 'inputQ', label: '⑤-ギフト釣銭' },
+                { key: 'tax', id: 'inputR', label: '⑥+消費税等' },
+            ];
+            const ROW_LABELS = {
+                sales: '売上合計', tax: '消費税等', total: '＊＝合計', customers: 'レジ客数',
+                cash: '現金', gift: 'ギフト', credit: '掛売', salesNormal: '売上(通常)', salesReduced: '売上(軽減)',
             };
-            const OCR_LABELS = {
-                total: '①＊＝合計',
-                customers: '②レジ客数',
-                cash: '③+現金',
-                credit: '④+掛売',
-                change: '⑤-ギフト釣銭',
-                tax: '⑥+消費税等',
-            };
-            // 画像を拡大する幅（px）。結果が揺れるため複数の幅で読み取り、多数決を取る
-            const OCR_WIDTHS = [940, 800, 1100, 1300];
+            const GIFT_FIELD_IDS = ['inputD', 'inputE', 'inputF', 'inputG', 'inputH', 'inputI', 'inputJ', 'inputL', 'inputM', 'inputN', 'inputO', 'inputP'];
 
             let ocrWorker = null;
+            let lastDaily = null; // 売上日報の読み取り結果（ギフト別日報との突き合わせ用）
+            let lastGift = null;  // ギフト別日報の読み取り結果
 
-            function toNumber(str) {
-                return parseInt(str.replace(/[^\d]/g, ''), 10);
-            }
-
-            // OCRテキスト1回分から各項目の値を抜き出す
-            function parseReceiptText(text) {
-                const lines = text.split(/\r?\n/).map(raw => {
-                    const tokens = raw.trim().split(/\s+/);
-                    const compact = raw.replace(/\s+/g, '');
-                    const last = tokens[tokens.length - 1] || '';
-                    const tokenMatch = last.match(/^\(?(\d[\d,.]*)\)?$/);
-                    const tailMatch = compact.match(/(\d[\d,.]*)\D{0,2}$/);
-                    const numText = tokenMatch ? tokenMatch[1] : (tailMatch ? tailMatch[1] : null);
-                    return { text: compact, numText, value: numText ? toNumber(numText) : null };
-                }).filter(l => l.text.length > 0);
-
-                const has = (s, ...words) => words.some(w => s.includes(w));
-                const find = (test, from = 0) => {
-                    for (let i = Math.max(from, 0); i < lines.length; i++) {
-                        if (lines[i].value !== null && test(lines[i].text)) return i;
-                    }
-                    return -1;
-                };
-                const valueAt = i => (i >= 0 && i < lines.length ? lines[i].value : null);
-
-                const idx = {};
-                idx.sales = find(s => has(s, '売上合計'));
-                idx.customers = find(s => has(s, '客数'));
-                idx.unitPrice = find(s => has(s, '単価'), idx.customers);
-                idx.tax = find(s => has(s, '税等') || (has(s, '消費税') && !has(s, '値引')), idx.customers);
-                idx.total = find(s => has(s, '合計', '合', '=') && !has(s, '通常', '軽減', '売上', 'メニュー', '割増', '税'), idx.tax + 1);
-                idx.cash = find(s => has(s, '現金', '現'), idx.total + 1);
-                // 現金は【支払内訳】の次の行
-                if (idx.cash < 0) {
-                    const heading = lines.findIndex((l, i) => i > idx.total && has(l.text, '支払', '内訳'));
-                    if (heading >= 0) idx.cash = find(() => true, heading + 1);
-                }
-                idx.change = find(s => has(s, 'ギフ', 'フト') && has(s, '釣', '銭'), idx.cash + 1);
-                // ギフト釣銭は「ギフト過剰」の次の行
-                if (idx.change < 0) {
-                    const excess = find(s => has(s, '過剰'), idx.cash + 1);
-                    if (excess >= 0) idx.change = find(() => true, excess + 1);
-                }
-                idx.credit = find(s => has(s, '掛売', '掛'), idx.cash + 1);
-                // 掛売はギフト釣銭の次の行
-                if (idx.credit < 0 && idx.change >= 0) idx.credit = idx.change + 1;
-
-                // レジ単価は小数第2位まで（例: 1,147.85）。区切りの誤読に備えて末尾2桁を小数とみなす
-                const unitDigits = idx.unitPrice >= 0 ? lines[idx.unitPrice].numText.replace(/[^\d]/g, '') : '';
-
-                return {
-                    total: valueAt(idx.total),
-                    customers: valueAt(idx.customers),
-                    cash: valueAt(idx.cash),
-                    credit: valueAt(idx.credit),
-                    change: valueAt(idx.change),
-                    tax: valueAt(idx.tax),
-                    sales: valueAt(idx.sales),
-                    unitPrice: unitDigits.length >= 3 ? parseInt(unitDigits, 10) / 100 : null,
-                    // 「+ギフト」は現金の次の行（検算用）
-                    gift: idx.cash >= 0 ? valueAt(idx.cash + 1) : null,
-                };
-            }
-
-            // 複数回のOCR結果を多数決でまとめ、レシートの検算で裏付ける
-            function combineResults(results) {
-                const keys = ['total', 'customers', 'cash', 'credit', 'change', 'tax', 'sales', 'unitPrice', 'gift'];
-                const candidates = {};
-                const pick = {};
-                for (const key of keys) {
-                    const counts = new Map();
-                    for (const r of results) {
-                        if (r[key] !== null && !isNaN(r[key])) counts.set(r[key], (counts.get(r[key]) || 0) + 1);
-                    }
-                    candidates[key] = [...counts.entries()].sort((a, b) => b[1] - a[1]).map(e => e[0]);
-                    pick[key] = candidates[key].length ? candidates[key][0] : null;
-                }
-
-                // 合計 = 売上合計 + 消費税等
-                findCombination(() => {
-                    for (const total of candidates.total)
-                        for (const sales of candidates.sales)
-                            for (const tax of candidates.tax)
-                                if (sales + tax === total) return { total, sales, tax };
-                });
-                // 合計 = 現金 + ギフト + 掛売
-                findCombination(() => {
-                    if (pick.total === null) return;
-                    for (const cash of candidates.cash)
-                        for (const gift of candidates.gift)
-                            for (const credit of candidates.credit)
-                                if (cash + gift + credit === pick.total) return { cash, gift, credit };
-                });
-                // 売上合計 ÷ 客数 = レジ単価
-                findCombination(() => {
-                    if (pick.sales === null) return;
-                    for (const customers of candidates.customers)
-                        for (const unitPrice of candidates.unitPrice)
-                            if (customers > 0 && Math.abs(pick.sales / customers - unitPrice) < 0.01) return { customers, unitPrice };
-                });
-
-                function findCombination(search) {
-                    const found = search();
-                    if (found) Object.assign(pick, found);
-                }
-
-                const checks = [];
-                if (pick.total !== null && pick.sales !== null && pick.tax !== null) {
-                    checks.push({ label: '売上合計 + 消費税等 = ＊＝合計', ok: pick.sales + pick.tax === pick.total });
-                }
-                // ギフト釣銭がある日は支払内訳の内訳が変わるため、この検算は釣銭0円の日だけ行う
-                if (pick.change === 0 && pick.total !== null && pick.cash !== null && pick.gift !== null && pick.credit !== null) {
-                    checks.push({ label: '現金 + ギフト + 掛売 = ＊＝合計', ok: pick.cash + pick.gift + pick.credit === pick.total });
-                }
-                if (pick.sales !== null && pick.customers && pick.unitPrice !== null) {
-                    checks.push({ label: '売上合計 ÷ レジ客数 = レジ単価', ok: Math.abs(pick.sales / pick.customers - pick.unitPrice) < 0.01 });
-                }
-                return { values: pick, checks };
-            }
-
-            // 指定幅に拡大・縮小し、グレースケール化とコントラスト補正をかける
-            // 写真の中から白いレシート部分の範囲を探す（見つからなければ写真全体）
-            function findReceiptBounds(image) {
-                const full = { x: 0, y: 0, w: image.width, h: image.height };
-                const sw = 300;
-                const sh = Math.max(1, Math.round(image.height * sw / image.width));
-                const canvas = document.createElement('canvas');
-                canvas.width = sw;
-                canvas.height = sh;
-                const ctx = canvas.getContext('2d');
-                ctx.drawImage(image, 0, 0, sw, sh);
-                const d = ctx.getImageData(0, 0, sw, sh).data;
-                const gray = (x, y) => {
-                    const i = (y * sw + x) * 4;
-                    return 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-                };
-
-                // 明るい部分が最も長く続く区間を返す
-                function brightestRun(means) {
-                    const min = Math.min(...means);
-                    const max = Math.max(...means);
-                    if (max - min < 60) return null; // 背景との差がない＝レシートが全体に写っている
-                    // 文字の多い部分は少し暗くなるため、しきい値は背景寄りに置く
-                    const threshold = min + (max - min) * 0.35;
-                    const maxGap = Math.round(means.length * 0.03); // これより短い暗い区間はレシートの一部とみなす
-                    let best = null, start = -1, lastBright = -1;
-                    for (let i = 0; i <= means.length; i++) {
-                        if (i < means.length && means[i] >= threshold) {
-                            if (start < 0) start = i;
-                            lastBright = i;
-                        } else if (start >= 0 && (i === means.length || i - lastBright > maxGap)) {
-                            const end = lastBright + 1;
-                            if (!best || end - start > best.end - best.start) best = { start, end };
-                            start = -1;
-                        }
-                    }
-                    return best;
-                }
-
-                const colMeans = [];
-                for (let x = 0; x < sw; x++) {
-                    let sum = 0;
-                    for (let y = 0; y < sh; y++) sum += gray(x, y);
-                    colMeans.push(sum / sh);
-                }
-                const cols = brightestRun(colMeans) || { start: 0, end: sw };
-                if (cols.end - cols.start < sw * 0.15) return full;
-
-                const rowMeans = [];
-                for (let y = 0; y < sh; y++) {
-                    let sum = 0;
-                    for (let x = cols.start; x < cols.end; x++) sum += gray(x, y);
-                    rowMeans.push(sum / (cols.end - cols.start));
-                }
-                const rows = brightestRun(rowMeans) || { start: 0, end: sh };
-                if (rows.end - rows.start < sh * 0.15) return full;
-
-                // 少し余白を付けて元画像の座標に戻す
-                const ratio = image.width / sw;
-                const mx = (cols.end - cols.start) * 0.03;
-                const my = (rows.end - rows.start) * 0.01;
-                const x0 = Math.max(0, (cols.start - mx) * ratio);
-                const y0 = Math.max(0, (rows.start - my) * ratio);
-                const x1 = Math.min(image.width, (cols.end + mx) * ratio);
-                const y1 = Math.min(image.height, (rows.end + my) * ratio);
-                return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
-            }
-
-            function preprocess(image, bounds, width) {
-                const scale = width / bounds.w;
-                const canvas = document.createElement('canvas');
-                canvas.width = width;
-                canvas.height = Math.round(bounds.h * scale);
-                const ctx = canvas.getContext('2d');
-                ctx.imageSmoothingQuality = 'high';
-                ctx.drawImage(image, bounds.x, bounds.y, bounds.w, bounds.h, 0, 0, canvas.width, canvas.height);
-
-                const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
-                const d = img.data;
-                const gray = new Uint8ClampedArray(d.length / 4);
-                const hist = new Array(256).fill(0);
-                for (let i = 0; i < gray.length; i++) {
-                    gray[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
-                    hist[gray[i]]++;
-                }
-                // 上下1%を除いた明るさの範囲を0〜255に引き伸ばす
-                let low = 0, high = 255, acc = 0;
-                for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= gray.length * 0.01) { low = v; break; } }
-                acc = 0;
-                for (let v = 255; v >= 0; v--) { acc += hist[v]; if (acc >= gray.length * 0.01) { high = v; break; } }
-                const range = Math.max(high - low, 1);
-                for (let i = 0; i < gray.length; i++) {
-                    const v = (gray[i] - low) * 255 / range;
-                    d[i * 4] = d[i * 4 + 1] = d[i * 4 + 2] = v;
-                }
-                ctx.putImageData(img, 0, 0);
-                return canvas;
-            }
-
+            // ---------- 画像の補正 ----------
             function loadImage(file) {
                 return new Promise((resolve, reject) => {
                     const img = new Image();
@@ -754,6 +1133,74 @@
                 });
             }
 
+            function drawScaled(source, width, sx = 0, sy = 0, sw = source.width, sh = source.height) {
+                const canvas = document.createElement('canvas');
+                canvas.width = Math.round(width);
+                canvas.height = Math.max(1, Math.round(sh * width / sw));
+                const ctx = canvas.getContext('2d');
+                ctx.imageSmoothingQuality = 'high';
+                ctx.drawImage(source, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+                return canvas;
+            }
+
+            function grayOf(canvas) {
+                const d = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
+                const gray = new Uint8Array(canvas.width * canvas.height);
+                for (let i = 0; i < gray.length; i++) gray[i] = Math.round(0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2]);
+                return gray;
+            }
+
+            // 時計回りに deg 度回した画像を返す（はみ出さないよう広げ、余白は灰色）
+            function rotateCanvas(source, deg) {
+                const rad = deg * Math.PI / 180;
+                const cos = Math.abs(Math.cos(rad)), sin = Math.abs(Math.sin(rad));
+                const canvas = document.createElement('canvas');
+                canvas.width = Math.round(source.width * cos + source.height * sin);
+                canvas.height = Math.round(source.width * sin + source.height * cos);
+                const ctx = canvas.getContext('2d');
+                ctx.fillStyle = '#808080';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.translate(canvas.width / 2, canvas.height / 2);
+                ctx.rotate(rad);
+                ctx.imageSmoothingQuality = 'high';
+                ctx.drawImage(source, -source.width / 2, -source.height / 2);
+                return canvas;
+            }
+
+            // 傾きを直し、レシート部分を切り出して白黒の濃淡をはっきりさせる
+            async function prepareImage(file) {
+                const img = await loadImage(file);
+                const base = drawScaled(img, Math.min(img.width, 2000));
+                const small = drawScaled(base, 600);
+                const skew = ReceiptCore.estimateSkew(grayOf(small), small.width, small.height);
+                const rotated = Math.abs(skew) >= 0.2 ? rotateCanvas(base, -skew) : base;
+
+                const s300 = drawScaled(rotated, 300);
+                const cols = ReceiptCore.findPaperColumns(grayOf(s300), s300.width, s300.height);
+                const ratio = rotated.width / s300.width;
+                const canvas = drawScaled(rotated, OCR_WIDTH, cols.left * ratio, 0, (cols.right - cols.left) * ratio, rotated.height);
+
+                // 明るさの上下1%を除いた範囲を0〜255に引き伸ばす
+                const gray = grayOf(canvas);
+                const hist = new Array(256).fill(0);
+                for (const v of gray) hist[v]++;
+                let low = 0, high = 255, acc = 0;
+                for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= gray.length * 0.01) { low = v; break; } }
+                acc = 0;
+                for (let v = 255; v >= 0; v--) { acc += hist[v]; if (acc >= gray.length * 0.01) { high = v; break; } }
+                const range = Math.max(high - low, 1);
+                const ctx = canvas.getContext('2d');
+                const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                for (let i = 0; i < gray.length; i++) {
+                    const v = Math.max(0, Math.min(255, Math.round((gray[i] - low) * 255 / range)));
+                    gray[i] = v;
+                    imageData.data[i * 4] = imageData.data[i * 4 + 1] = imageData.data[i * 4 + 2] = v;
+                }
+                ctx.putImageData(imageData, 0, 0);
+                return { canvas, gray, w: canvas.width, h: canvas.height, skew };
+            }
+
+            // ---------- 読み取り ----------
             async function getWorker() {
                 if (!ocrWorker) {
                     ocrStatus.textContent = '読み取りの準備中…（初回は日本語データのダウンロードに時間がかかります）';
@@ -763,61 +1210,57 @@
                 return ocrWorker;
             }
 
-            function showChecks(checks) {
-                ocrChecks.innerHTML = '';
-                for (const check of checks) {
-                    const li = document.createElement('li');
-                    li.className = check.ok ? 'ok' : 'ng';
-                    li.textContent = (check.ok ? '✓ 検算OK: ' : '⚠ 検算が合いません: ') + check.label;
-                    ocrChecks.appendChild(li);
+            function labelsFrom(data) {
+                const labels = [];
+                for (const block of data.blocks || []) {
+                    for (const para of block.paragraphs) {
+                        for (const line of para.lines) labels.push({ text: line.text.replace(/\s+/g, ''), y0: line.bbox.y0, y1: line.bbox.y1 });
+                    }
                 }
+                return labels;
+            }
+
+            // 数字の行を読む。ギフト別日報では件数と金額の2つの塊になる
+            function readNumberLines(im, labels, gift) {
+                const fromX = gift ? 0.4 : 0.45;
+                const items = [];
+                for (const ln of ReceiptCore.findNumberLines(im.gray, im.w, im.h, fromX)) {
+                    const pad = (ln.y1 - ln.y0) * 0.15;
+                    const seg = ReceiptCore.segmentLine(im.gray, im.w, im.h, im.w * fromX, im.w, ln.y0 - pad, ln.y1 + pad);
+                    if (!seg || !seg.groups.length) continue;
+                    const groups = seg.groups.map(g => ReceiptCore.readGroup(seg, g).text);
+                    items.push({ y: ln.y, y0: ln.y0, y1: ln.y1, groups, text: groups[groups.length - 1], label: ReceiptCore.labelAt(labels, ln.y0, ln.y1) });
+                }
+                return items;
             }
 
             async function readReceipt(file) {
                 cameraButton.classList.add('disabled');
-                ocrChecks.innerHTML = '';
+                ocrResult.innerHTML = '';
                 ocrRawWrap.style.display = 'none';
                 try {
-                    const image = await loadImage(file);
-                    // 読み取りに使うレシート部分をプレビューに表示
-                    const bounds = findReceiptBounds(image);
-                    ocrPreview.src = preprocess(image, bounds, 600).toDataURL('image/jpeg', 0.8);
+                    ocrStatus.textContent = '画像を補正中…';
+                    const im = await prepareImage(file);
+                    ocrPreview.src = drawScaled(im.canvas, 600).toDataURL('image/jpeg', 0.8);
                     ocrPreview.style.display = 'block';
 
                     const worker = await getWorker();
-                    const results = [];
-                    let combined = null;
-                    for (let i = 0; i < OCR_WIDTHS.length; i++) {
-                        ocrStatus.textContent = `読み取り中…（${i + 1}/${OCR_WIDTHS.length}回目）`;
-                        const { data } = await worker.recognize(preprocess(image, bounds, OCR_WIDTHS[i]));
-                        results.push(parseReceiptText(data.text));
-                        ocrRaw.textContent = data.text;
-                        combined = combineResults(results);
-                        const allFound = Object.keys(OCR_FIELDS).every(key => combined.values[key] !== null);
-                        // 全項目が揃い、検算がすべて合えば終了
-                        if (allFound && combined.checks.length >= 2 && combined.checks.every(c => c.ok)) break;
-                    }
+                    ocrStatus.textContent = '読み取り中…';
+                    const { data } = await worker.recognize(im.canvas, {}, { blocks: true });
+                    const labels = labelsFrom(data);
 
-                    const missing = [];
-                    for (const [key, id] of Object.entries(OCR_FIELDS)) {
-                        const input = document.getElementById(id);
-                        const value = combined.values[key];
-                        if (value === null) {
-                            missing.push(OCR_LABELS[key]);
-                            continue;
-                        }
-                        input.value = value;
-                        input.classList.add('ocr-filled');
-                    }
-                    calculateSettlement();
-                    showChecks(combined.checks);
+                    const dailyItems = readNumberLines(im, labels, false);
+                    const isGift = ReceiptCore.isGiftReport(labels.map(l => l.text).join(''), dailyItems);
+                    const items = isGift ? readNumberLines(im, labels, true) : dailyItems;
+                    ocrRaw.textContent = `傾き補正: ${im.skew}°\n` + items.map(it => `${it.label || '（項目名なし）'} → ${it.groups.join(' ')}`).join('\n');
                     ocrRawWrap.style.display = 'block';
-                    if (missing.length) {
-                        ocrStatus.textContent = `読み取れなかった項目: ${missing.join('、')}（手入力してください）`;
-                    } else if (combined.checks.some(c => !c.ok)) {
-                        ocrStatus.textContent = '⚠ 検算が合わない項目があります。黄色の欄をレシートと見比べて修正するか、撮り直してください。';
+
+                    if (isGift) {
+                        handleGiftReport(ReceiptCore.solveGiftReport(ReceiptCore.extractGiftPairs(items, labels)));
                     } else {
-                        ocrStatus.textContent = '読み取り完了。黄色の欄の値がレシートと合っているか確認してください。';
+                        const rows = ReceiptCore.alignDailyRows(items);
+                        if (!rows) throw new Error('売上日報の項目を見つけられませんでした。撮り直してください');
+                        handleDailyReport(ReceiptCore.solveDailyReport(rows));
                     }
                 } catch (err) {
                     console.error(err);
@@ -825,6 +1268,132 @@
                 } finally {
                     cameraButton.classList.remove('disabled');
                     receiptInput.value = '';
+                }
+            }
+
+            // ---------- 結果の反映と表示 ----------
+            function setField(id, value) {
+                const input = document.getElementById(id);
+                input.value = value;
+                input.classList.add('ocr-filled');
+            }
+
+            function checkItem(ok, text) {
+                const li = document.createElement('li');
+                li.className = ok ? 'ok' : 'ng';
+                li.textContent = (ok ? '✓ ' : '⚠ ') + text;
+                return li;
+            }
+
+            function section(title) {
+                const div = document.createElement('div');
+                div.className = 'ocr-result-block';
+                const h3 = document.createElement('h3');
+                h3.textContent = title;
+                div.appendChild(h3);
+                ocrResult.appendChild(div);
+                return div;
+            }
+
+            // 売上日報の「+ギフト」とギフト別日報の合計の突き合わせ
+            function crossCheck(list) {
+                if (!lastDaily || !lastGift || !lastGift.total) return;
+                const ok = lastDaily.values.gift === lastGift.total.amount;
+                list.appendChild(checkItem(ok, `ギフト別日報の合計（${lastGift.total.amount.toLocaleString()}）= 売上日報の+ギフト（${lastDaily.values.gift.toLocaleString()}）`));
+            }
+
+            function handleDailyReport(result) {
+                lastDaily = result;
+                const v = result.values;
+                const missing = [];
+                for (const f of DAILY_FIELDS) {
+                    if (v[f.key] === null || v[f.key] === undefined) missing.push(f.label);
+                    else setField(f.id, v[f.key]);
+                }
+                calculateSettlement();
+
+                const block = section('売上日報を読み取りました');
+                const list = document.createElement('ul');
+                list.className = 'ocr-checks';
+                for (const c of result.checks) list.appendChild(checkItem(c.ok, (c.ok ? '検算OK: ' : '読み取り値が検算と合いません: ') + c.label));
+                crossCheck(list);
+                block.appendChild(list);
+                if (result.corrected.length) {
+                    const p = document.createElement('p');
+                    p.className = 'ocr-note-small';
+                    p.textContent = '検算で補正した項目: ' + result.corrected.map(c => `${ROW_LABELS[c.key] || c.key}「${c.read}」→ ${c.value.toLocaleString()}`).join('、');
+                    block.appendChild(p);
+                }
+
+                if (result.unreliable) {
+                    ocrStatus.textContent = '⚠ 読み取り結果に自信がありません。撮り直すか、黄色の欄をレシートと見比べて修正してください。';
+                } else if (missing.length) {
+                    ocrStatus.textContent = `読み取れなかった項目: ${missing.join('、')}（手入力してください）`;
+                } else if (result.checks.some(c => !c.ok)) {
+                    ocrStatus.textContent = '検算で一部の数字を補正しました。黄色の欄がレシートと合っているか確認してください。';
+                } else {
+                    ocrStatus.textContent = '読み取り完了。黄色の欄の値がレシートと合っているか確認してください。';
+                }
+            }
+
+            // ギフト別日報の明細を入力欄に反映する（一覧にないギフトは空欄にする）
+            function applyGiftEntries() {
+                for (const id of GIFT_FIELD_IDS) {
+                    const input = document.getElementById(id);
+                    input.value = '';
+                    input.classList.remove('ocr-filled');
+                }
+                const sums = {};
+                for (const e of lastGift.entries) {
+                    if (!e.type) continue;
+                    sums[e.type.amount] = (sums[e.type.amount] || 0) + e.amount;
+                    if (e.type.count) sums[e.type.count] = (sums[e.type.count] || 0) + e.count;
+                }
+                for (const [id, value] of Object.entries(sums)) setField(id, value);
+                calculateSettlement();
+            }
+
+            function handleGiftReport(result) {
+                if (!result.entries.length) throw new Error('ギフト別日報の件数・金額を見つけられませんでした。撮り直してください');
+                lastGift = result;
+                applyGiftEntries();
+
+                const block = section('ギフト別日報を読み取りました');
+                const table = document.createElement('table');
+                table.className = 'ocr-gift-table';
+                table.innerHTML = '<thead><tr><th>ギフトの種類</th><th>件数</th><th>金額</th></tr></thead>';
+                const tbody = document.createElement('tbody');
+                for (const e of result.entries) {
+                    const tr = document.createElement('tr');
+                    const select = document.createElement('select');
+                    select.innerHTML = '<option value="">（選んでください）</option>' +
+                        ReceiptCore.GIFT_TYPES.map((g, i) => `<option value="${i}">${g.name}</option>`).join('');
+                    select.value = e.type ? String(ReceiptCore.GIFT_TYPES.indexOf(e.type)) : '';
+                    select.addEventListener('change', () => {
+                        e.type = select.value === '' ? null : ReceiptCore.GIFT_TYPES[Number(select.value)];
+                        applyGiftEntries();
+                    });
+                    const td = document.createElement('td');
+                    td.appendChild(select);
+                    tr.appendChild(td);
+                    tr.insertAdjacentHTML('beforeend', `<td>${e.count.toLocaleString()}</td><td>${e.amount.toLocaleString()}</td>`);
+                    tbody.appendChild(tr);
+                }
+                table.appendChild(tbody);
+                block.appendChild(table);
+
+                const list = document.createElement('ul');
+                list.className = 'ocr-checks';
+                for (const c of result.checks) list.appendChild(checkItem(c.ok, (c.ok ? '検算OK: ' : '検算が合いません: ') + c.label));
+                crossCheck(list);
+                block.appendChild(list);
+
+                if (result.entries.some(e => !e.type)) {
+                    ocrStatus.textContent = '⚠ ギフトの種類を判別できない行があります。一覧で種類を選んでください。';
+                } else if (result.checks.some(c => !c.ok)) {
+                    ocrStatus.textContent = '⚠ 検算が合いません。撮り直すか、ギフト欄をレシートと見比べて修正してください。';
+                } else {
+                    ocrStatus.textContent = '読み取り完了。ギフトの種類と金額が合っているか確認してください。';
                 }
             }
 
