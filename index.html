@@ -649,7 +649,7 @@
             // 数字の上端（背の高い文字の上端の中央値）
             const tops = clean.filter(g => g.y1 - g.y0 + 1 >= digitH * 0.7).map(g => g.y0).sort((a, c) => a - c);
             const digitTop = tops.length ? tops[Math.floor(tops.length / 2)] : top;
-            return { ink, rw, rh, groups, digitH, digitTop };
+            return { ink, rw, rh, groups, digitH, digitTop, x0: b.x0 };
         }
 
         // ---------- 文字の判定（見本の字形との照合） ----------
@@ -984,13 +984,22 @@
             { name: 'ACS値引券 釣銭無', amount: 'inputI', test: t => /ACS|AC|値引|引券/.test(t) },
             { name: 'WAONポイント', amount: 'inputJ', test: t => /WAON|WA|ポイント|イント/.test(t) },
             { name: 'グルメカード', amount: 'inputL', test: t => /グルメ|ルメ|カード/.test(t) },
-            { name: 'SC500円券', amount: 'inputM', test: t => /500|円券/.test(t) },
+            { name: 'SC500円券', amount: 'inputM', test: t => /5[0OoＯ○]{2}|円券|円/.test(t) },
             { name: 'RHG共通商品券', amount: 'inputN', test: t => /RHG|RH|共通/.test(t) },
             { name: 'SC割引券', amount: 'inputO', test: t => /割引|割/.test(t) },
             { name: 'SC商品券', amount: 'inputH', test: t => /商品|品券/.test(t) },
             { name: 'SCギフト 釣銭無', amount: 'inputD', count: 'inputE', test: t => /無|釣|銭/.test(t) },
             { name: 'SCギフト', amount: 'inputF', count: 'inputG', test: t => /ギ|フト/.test(t) },
         ];
+
+        // ギフト別日報のコード番号（「3:ＳＣギフト 釣銭無」の 3）→ ギフトの種類。
+        // 名前より番号のほうが読み取りが安定しているので優先する（実物の日報で確認できたもの）
+        const GIFT_CODES = { 3: 'SCギフト 釣銭無', 5: 'SC500円券', 24: 'WAONポイント' };
+
+        function giftTypeOf(name, code) {
+            if (code !== null && GIFT_CODES[code]) return GIFT_TYPES.find(g => g.name === GIFT_CODES[code]);
+            return GIFT_TYPES.find(g => g.test(name.replace(/^.{0,2}\d+[:：]/, ''))) || null;
+        }
 
         // 数字の行（items）から「件数 金額」の組を取り出す。ギフト名は同じ行かその上の行
         function extractGiftPairs(items, labels) {
@@ -1000,10 +1009,23 @@
                 if (header && it.y0 < header.y1) continue;
                 if (it.groups.length < 2) continue;
                 const [c, a] = it.groups.slice(-2);
-                if (!/^\d{1,4}$/.test(c) || !/^\d{1,3}(,\d{3})*$/.test(a)) continue;
+                // 金額は整数。ぼけた写真ではカンマが「.」に見えることがあるので区別しない
+                if (!/^\d{1,4}$/.test(c) || !/^\d[\d,.]*$/.test(a) || digitsOf(a).length > 7) continue;
                 if (parseInt(digitsOf(a), 10) < parseInt(c, 10)) continue; // 金額は件数以上
                 const above = labels.filter(l => l.y1 <= it.y0 + 5).sort((x, y) => y.y1 - x.y1)[0];
-                pairs.push({ y: it.y, count: parseInt(c, 10), amount: parseInt(digitsOf(a), 10), name: (above ? above.text : '') + it.label });
+                const aboveText = above ? above.text : '';
+                const codeMatch = aboveText.match(/^\D{0,2}?(\d{1,2})[:：;]/);
+                pairs.push({
+                    y: it.y, right: it.right, digitH: it.digitH,
+                    count: parseInt(c, 10), amount: parseInt(digitsOf(a), 10),
+                    name: aboveText + it.label, code: codeMatch ? parseInt(codeMatch[1], 10) : null,
+                });
+            }
+            // 金額は右寄せで、■合計■（最後の行）の金額と右端がそろう。
+            // そろわないもの（ギフト名の「釣銭無」などを数字と誤認したもの）は除く
+            const last = pairs[pairs.length - 1];
+            if (last && last.right !== undefined) {
+                return pairs.filter(p => Math.abs(p.right - last.right) <= last.digitH * 0.8);
             }
             return pairs;
         }
@@ -1013,8 +1035,24 @@
             if (!pairs.length) return { entries: [], total: null, checks: [] };
             // 最後の「件数 金額」行が ■合計■
             const total = pairs.length >= 2 ? pairs[pairs.length - 1] : null;
-            const entries = (total ? pairs.slice(0, -1) : pairs).map(p => ({
-                type: GIFT_TYPES.find(g => g.test(p.name.replace(/^.{0,2}\d+[:：]/, ''))) || null,
+            let candidates = total ? pairs.slice(0, -1) : pairs;
+            // 合計と合わないときは、件数・金額の合計が■合計■と一致する組み合わせを探す
+            // （明細でない行を明細と誤認した場合に備える）
+            const sums = list => [list.reduce((s, p) => s + p.count, 0), list.reduce((s, p) => s + p.amount, 0)];
+            if (total && candidates.length <= 12) {
+                const [c0, a0] = sums(candidates);
+                if (c0 !== total.count || a0 !== total.amount) {
+                    let best = null;
+                    for (let mask = 1; mask < (1 << candidates.length); mask++) {
+                        const sub = candidates.filter((_, i) => mask & (1 << i));
+                        const [c, a] = sums(sub);
+                        if (c === total.count && a === total.amount && (!best || sub.length > best.length)) best = sub;
+                    }
+                    if (best) candidates = best;
+                }
+            }
+            const entries = candidates.map(p => ({
+                type: giftTypeOf(p.name, p.code),
                 name: p.name, count: p.count, amount: p.amount,
             }));
             const checks = [];
@@ -1251,7 +1289,12 @@
                     const seg = ReceiptCore.segmentLine(im.gray, im.w, im.h, im.w * fromX, im.w, ln.y0 - pad, ln.y1 + pad);
                     if (!seg || !seg.groups.length) continue;
                     const groups = seg.groups.map(g => ReceiptCore.readGroup(seg, g).text);
-                    items.push({ y: ln.y, y0: ln.y0, y1: ln.y1, groups, text: groups[groups.length - 1], label: ReceiptCore.labelAt(labels, ln.y0, ln.y1) });
+                    const lastGroup = seg.groups[seg.groups.length - 1];
+                    items.push({
+                        y: ln.y, y0: ln.y0, y1: ln.y1, groups, text: groups[groups.length - 1],
+                        right: seg.x0 + lastGroup[lastGroup.length - 1].x1, digitH: seg.digitH,
+                        label: ReceiptCore.labelAt(labels, ln.y0, ln.y1),
+                    });
                 }
                 return items;
             }
