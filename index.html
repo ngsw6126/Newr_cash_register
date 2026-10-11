@@ -494,6 +494,74 @@
             return { left, right };
         }
 
+        // 紙らしさ（明るく、赤み＝木の机の色が少ないほど高い）を、文字がつぶれる程度にぼかして返す。
+        // rgba は縮小画像の画素（RGBA の並び）
+        function paperScore(rgba, w, h) {
+            const score = new Float32Array(w * h);
+            for (let i = 0; i < score.length; i++) {
+                const r = rgba[i * 4], g = rgba[i * 4 + 1], b = rgba[i * 4 + 2];
+                score[i] = 0.299 * r + 0.587 * g + 0.114 * b - 3 * Math.max(0, r - b);
+            }
+            const rad = 6;
+            const tmp = new Float32Array(w * h), out = new Uint8Array(w * h);
+            for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+                let sum = 0, n = 0;
+                for (let d = -rad; d <= rad; d++) { const xx = x + d; if (xx >= 0 && xx < w) { sum += score[y * w + xx]; n++; } }
+                tmp[y * w + x] = sum / n;
+            }
+            for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+                let sum = 0, n = 0;
+                for (let d = -rad; d <= rad; d++) { const yy = y + d; if (yy >= 0 && yy < h) { sum += tmp[yy * w + x]; n++; } }
+                out[y * w + x] = Math.max(0, Math.min(255, Math.round(sum / n)));
+            }
+            return out;
+        }
+
+        // 紙（明るく広い領域）の上下左右を探す。gray は縮小画像（幅 300 程度）の紙らしさ。
+        // 写真の一部にしか紙が写っていない場合に、机などを読み取りの対象から外すため
+        function findPaperBox(gray, w, h) {
+            const fallback = () => ({ left: 0, right: w, top: 0, bottom: h });
+            const th = otsu(gray);
+            const mask = new Uint8Array(w * h);
+            for (let i = 0; i < mask.length; i++) mask[i] = gray[i] > th ? 1 : 0;
+            // 明るい部分のうち最も大きなかたまり
+            const label = new Int32Array(w * h).fill(-1);
+            let bestId = -1, bestSize = 0;
+            const stack = [];
+            for (let start = 0; start < mask.length; start++) {
+                if (!mask[start] || label[start] >= 0) continue;
+                let size = 0;
+                label[start] = start;
+                stack.push(start);
+                while (stack.length) {
+                    const i = stack.pop();
+                    size++;
+                    const x = i % w, y = (i - x) / w;
+                    const nb = [x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1, y > 0 ? i - w : -1, y < h - 1 ? i + w : -1];
+                    for (const j of nb) if (j >= 0 && mask[j] && label[j] < 0) { label[j] = start; stack.push(j); }
+                }
+                if (size > bestSize) { bestSize = size; bestId = start; }
+            }
+            if (bestSize < w * h * 0.08) return fallback();
+            const colCount = new Array(w).fill(0), rowCount = new Array(h).fill(0);
+            for (let i = 0; i < label.length; i++) if (label[i] === bestId) { colCount[i % w]++; rowCount[Math.floor(i / w)]++; }
+            // かたまりの大部分を占める範囲（はみ出した机の明るい部分などは除く）
+            const span = counts => {
+                const max = Math.max(...counts);
+                let peak = counts.indexOf(max), a = peak, b = peak;
+                while (a > 0 && counts[a - 1] >= max * 0.12) a--;
+                while (b < counts.length - 1 && counts[b + 1] >= max * 0.12) b++;
+                return [a, b + 1];
+            };
+            const [left, right] = span(colCount);
+            const [top, bottom] = span(rowCount);
+            if ((right - left) < w * 0.15 || (bottom - top) < h * 0.15) return fallback();
+            // 左右は紙の縁（影や机がわずかに残る）より少し内側で切る。数字の列の右端に机が残ると
+            // すべての行に文字があるように見えてしまうため。上下は少し外側まで含める
+            const mx = Math.max(2, Math.round((right - left) * 0.025)), my = Math.round(h * 0.01);
+            return { left: left + mx, right: right - mx, top: Math.max(0, top - my), bottom: Math.min(h, bottom + my) };
+        }
+
         // ---------- 文字の切り出し ----------
         function otsu(values) {
             const hist = new Array(256).fill(0);
@@ -552,8 +620,9 @@
 
         // 写真の傾き（度、時計回りが正）を推定する。文字の行が横一直線にそろう角度を探す。
         // 机の木目などの影響を避けるため、紙がある可能性の高い中央部分だけを見る
-        function estimateSkew(gray, w, h) {
-            const b = binarize(gray, w, h, w * 0.3, h * 0.05, w * 0.7, h * 0.95);
+        // area は見る範囲（0〜1 の割合）。省略時は写真の中央部分
+        function estimateSkew(gray, w, h, area = { x0: 0.3, y0: 0.05, x1: 0.7, y1: 0.95 }) {
+            const b = binarize(gray, w, h, w * area.x0, h * area.y0, w * area.x1, h * area.y1);
             if (!b) return 0;
             const pts = [];
             for (let y = 0; y < b.rh; y++) for (let x = 0; x < b.rw; x++) if (b.ink[y * b.rw + x]) pts.push(x, y);
@@ -580,10 +649,11 @@
             const b = binarize(gray, w, h, w * fromX, 0, w, h);
             if (!b) return [];
             const minInk = Math.max(2, b.rw * 0.004);
-            const rows = [];
+            const rows = [], counts = [];
             for (let y = 0; y < b.rh; y++) {
                 let c = 0;
                 for (let x = 0; x < b.rw; x++) c += b.ink[y * b.rw + x];
+                counts.push(c);
                 rows.push(c >= minInk);
             }
             const runs = [];
@@ -593,8 +663,10 @@
                 else if (s >= 0) { runs.push([s, y]); s = -1; }
             }
             if (!runs.length) return [];
+            // 1行の高さの目安。紙の縁の影などの細かいかたまりに引きずられないよう、ある程度高いものだけで求める
             const heights = runs.map(r => r[1] - r[0]).sort((a, c) => a - c);
-            const typical = heights[Math.floor(heights.length * 0.75)];
+            const tallish = heights.filter(v => v >= heights[Math.floor(heights.length * 0.9)] * 0.5);
+            const typical = tallish[Math.floor(tallish.length / 2)];
             // ごく狭い隙間で分かれた行はつなぐ（カンマの下など）
             const merged = [runs[0].slice()];
             for (let i = 1; i < runs.length; i++) {
@@ -602,8 +674,22 @@
                 if (runs[i][0] - last[1] <= typical * 0.15 && runs[i][1] - last[0] <= typical * 1.4) last[1] = runs[i][1];
                 else merged.push(runs[i].slice());
             }
-            return merged.filter(r => r[1] - r[0] >= typical * 0.35 && r[1] - r[0] <= typical * 2.2)
-                .map(r => ({ y0: r[0], y1: r[1], y: (r[0] + r[1]) / 2 }));
+            // 行の間に隙間がなくつながった背の高いかたまりは、インクの最も薄い高さで行ごとに分ける
+            const split = [];
+            const splitRun = ([a, c]) => {
+                if (c - a <= typical * 1.8) { split.push([a, c, arguments[0][2]]); return; }
+                let best = -1;
+                for (let y = Math.round(a + typical * 0.5); y <= Math.round(c - typical * 0.5); y++) if (best < 0 || counts[y] < counts[best]) best = y;
+                // 行の切れ目らしい（インクがほとんどない）高さがなければ分けない
+                const inRun = counts.slice(a, c).sort((x, y) => x - y);
+                const med = inRun[Math.floor(inRun.length / 2)];
+                if (best < 0 || counts[best] > med * 0.5) { split.push([a, c]); return; }
+                splitRun([a, best, true]);
+                splitRun([best + 1, c, true]);
+            };
+            merged.forEach(splitRun);
+            return split.filter(r => r[1] - r[0] >= typical * 0.35 && r[1] - r[0] <= typical * 2.2)
+                .map(r => ({ y0: r[0], y1: r[1], y: (r[0] + r[1]) / 2, tight: !!r[2] }));
         }
 
         // 1行分の範囲から、右寄せの数字の塊（グループ）を文字ごとに切り出す。groups は左から順
@@ -637,8 +723,35 @@
                     glyphs.splice(i, 2, { x0: a.x0, x1: c.x1, y0: Math.min(a.y0, c.y0), y1: Math.max(a.y1, c.y1) });
                 }
             }
-            // ゴミ（極端に小さい点）を除く
-            const clean = glyphs.filter(g => (g.y1 - g.y0 + 1) >= digitH * 0.12 || (g.x1 - g.x0) >= digitH * 0.12);
+            // ピントが甘いと隣の数字とつながることがある。数字1文字の幅より明らかに広いかたまりは、
+            // インクの最も薄い列で分ける
+            const widths = glyphs.filter(g => g.y1 - g.y0 + 1 >= digitH * 0.7 && g.x1 - g.x0 >= digitH * 0.3 && g.x1 - g.x0 <= digitH * 0.7)
+                .map(g => g.x1 - g.x0).sort((a, c) => a - c);
+            const digitW = widths.length ? widths[Math.floor(widths.length / 2)] : digitH * 0.5;
+            for (let i = glyphs.length - 1; i >= 0; i--) {
+                const g = glyphs[i];
+                const gw = g.x1 - g.x0;
+                if (gw < digitW * 1.6 || g.y1 - g.y0 + 1 < digitH * 0.7) continue;
+                const n = Math.max(2, Math.round(gw / (digitW + digitH * 0.1)));
+                const cuts = [g.x0];
+                for (let k = 1; k < n; k++) {
+                    const center = g.x0 + gw * k / n, r = digitW * 0.25;
+                    let best = Math.round(center);
+                    for (let x = Math.round(center - r); x <= Math.round(center + r); x++) if (x > g.x0 && x < g.x1 && colInk[x] < colInk[best]) best = x;
+                    cuts.push(best);
+                }
+                cuts.push(g.x1);
+                const parts = [];
+                for (let k = 0; k < n; k++) {
+                    const a = cuts[k], c = cuts[k + 1];
+                    let gt = bottom, gb = top;
+                    for (let y = top; y <= bottom; y++) for (let x = a; x < c; x++) if (ink[y * rw + x]) { if (y < gt) gt = y; if (y > gb) gb = y; }
+                    if (gb >= gt) parts.push({ x0: a, x1: c, y0: gt, y1: gb });
+                }
+                glyphs.splice(i, 1, ...parts);
+            }
+            // ゴミ（極端に小さい点）と、範囲の右端に接しているもの（紙の縁の影など。数字は紙の端に接しない）を除く
+            const clean = glyphs.filter(g => ((g.y1 - g.y0 + 1) >= digitH * 0.12 || (g.x1 - g.x0) >= digitH * 0.12) && g.x1 < rw - 1);
             // 大きく空いたところで塊に分ける
             const groups = [];
             for (const g of clean) {
@@ -839,11 +952,12 @@
         function solveDailyReport(rows) {
             const obs = key => (rows[key] && rows[key].text) || null;
             const read = key => { const d = digitsOf(obs(key)); return d ? parseInt(d, 10) : null; };
+            // 読み取り値を直すほど不利にする。直す行の数が少ない解釈を優先するため、行ごとにも少し加える
             const memo = new Map();
             const cost = (key, value) => {
                 if (obs(key) === null || value === null) return 0;
                 const k = key + ':' + value;
-                if (!memo.has(k)) memo.set(k, distance(obs(key), value));
+                if (!memo.has(k)) { const d = distance(obs(key), value); memo.set(k, d > 0 ? d + 0.3 : 0); }
                 return memo.get(k);
             };
             const candidatesFrom = (...keys) => {
@@ -982,23 +1096,29 @@
         const GIFT_TYPES = [
             { name: '指定ギフト券 釣銭無', amount: 'inputP', test: t => /指定|定ギ/.test(t) },
             { name: 'ACS値引券 釣銭無', amount: 'inputI', test: t => /ACS|AC|値引|引券/.test(t) },
-            { name: 'WAONポイント', amount: 'inputJ', test: t => /WAON|WA|ポイント|イント/.test(t) },
+            { name: 'WAONポイント', amount: 'inputJ', test: t => /WAON|WA|AON|ON|ポイ|イント|ント/.test(t) },
             { name: 'グルメカード', amount: 'inputL', test: t => /グルメ|ルメ|カード/.test(t) },
             { name: 'SC500円券', amount: 'inputM', test: t => /5[0OoＯ○]{2}|円券|円/.test(t) },
             { name: 'RHG共通商品券', amount: 'inputN', test: t => /RHG|RH|共通/.test(t) },
             { name: 'SC割引券', amount: 'inputO', test: t => /割引|割/.test(t) },
             { name: 'SC商品券', amount: 'inputH', test: t => /商品|品券/.test(t) },
             { name: 'SCギフト 釣銭無', amount: 'inputD', count: 'inputE', test: t => /無|釣|銭/.test(t) },
-            { name: 'SCギフト', amount: 'inputF', count: 'inputG', test: t => /ギ|フト/.test(t) },
+            // 釣銭有りの SCギフトは実物の日報でまだ確認できていない。「釣銭無」が読めなかっただけの
+            // 可能性が高いので名前では判定せず、一覧で選んでもらう
+            { name: 'SCギフト', amount: 'inputF', count: 'inputG', test: () => false },
         ];
 
         // ギフト別日報のコード番号（「3:ＳＣギフト 釣銭無」の 3）→ ギフトの種類。
         // 名前より番号のほうが読み取りが安定しているので優先する（実物の日報で確認できたもの）
         const GIFT_CODES = { 3: 'SCギフト 釣銭無', 5: 'SC500円券', 24: 'WAONポイント' };
 
-        function giftTypeOf(name, code) {
+        function giftTypeOf(name, code, count, amount) {
             if (code !== null && GIFT_CODES[code]) return GIFT_TYPES.find(g => g.name === GIFT_CODES[code]);
-            return GIFT_TYPES.find(g => g.test(name.replace(/^.{0,2}\d+[:：]/, ''))) || null;
+            const byName = GIFT_TYPES.find(g => g.test(name.replace(/^.{0,2}\d+[:：]/, '')));
+            // SC500円券は金額がちょうど「件数×500円」になる
+            const sc500 = GIFT_TYPES.find(g => g.name === 'SC500円券');
+            if (amount === count * 500 && (!byName || byName.name.startsWith('SCギフト'))) return sc500;
+            return byName || null;
         }
 
         // 数字の行（items）から「件数 金額」の組を取り出す。ギフト名は同じ行かその上の行
@@ -1007,27 +1127,54 @@
             const pairs = [];
             for (const it of items) {
                 if (header && it.y0 < header.y1) continue;
-                if (it.groups.length < 2) continue;
-                const [c, a] = it.groups.slice(-2);
+                // 右端の記号だけのかたまり（紙の縁の影など）は無視する
+                const idx = it.groups.map((g, i) => i).filter(i => /\d/.test(it.groups[i]));
+                if (idx.length < 2) continue;
+                const [c, a] = idx.slice(-2).map(i => it.groups[i]);
+                const right = it.rights ? it.rights[idx[idx.length - 1]] : undefined;
                 // 金額は整数。ぼけた写真ではカンマが「.」に見えることがあるので区別しない
-                if (!/^\d{1,4}$/.test(c) || !/^\d[\d,.]*$/.test(a) || digitsOf(a).length > 7) continue;
-                if (parseInt(digitsOf(a), 10) < parseInt(c, 10)) continue; // 金額は件数以上
-                const above = labels.filter(l => l.y1 <= it.y0 + 5).sort((x, y) => y.y1 - x.y1)[0];
-                const aboveText = above ? above.text : '';
-                const codeMatch = aboveText.match(/^\D{0,2}?(\d{1,2})[:：;]/);
+                if (!/^\d[\d,.]*$/.test(a) || digitsOf(a).length > 7) continue;
+                // 件数だけ読めないこともある（あとで■合計■から逆算する）
+                const count = /^(0|[1-9]\d{0,3})$/.test(c) ? parseInt(c, 10) : null; // 0から始まる数字は件数ではない（日付など）
+                if (count !== null && parseInt(digitsOf(a), 10) < count) continue; // 金額は件数以上
                 pairs.push({
-                    y: it.y, right: it.right, digitH: it.digitH,
-                    count: parseInt(c, 10), amount: parseInt(digitsOf(a), 10),
-                    name: aboveText + it.label, code: codeMatch ? parseInt(codeMatch[1], 10) : null,
+                    y: it.y, y0: it.y0, y1: it.y1, right, digitH: it.digitH, label: it.label,
+                    count, amount: parseInt(digitsOf(a), 10),
                 });
             }
-            // 金額は右寄せで、■合計■（最後の行）の金額と右端がそろう。
-            // そろわないもの（ギフト名の「釣銭無」などを数字と誤認したもの）は除く
-            const last = pairs[pairs.length - 1];
-            if (last && last.right !== undefined) {
-                return pairs.filter(p => Math.abs(p.right - last.right) <= last.digitH * 0.8);
+            if (!pairs.length) return pairs;
+            // ■合計■: 日本語の読み取りで「合計」が読めた行。読めなければ金額が最も大きい行（件数が読めた行のみ）
+            // （各明細以上になる）。それより下はレシート番号などなので除く
+            let ti = -1;
+            pairs.forEach((p, i) => { if (/合|計|■/.test(p.label) && p.count !== null) ti = i; });
+            // 次に、件数も金額もそれより上のどの明細以上になる最後の行（合計は各明細の和）。
+            // 誤読に備えて、件数だけで判定する方法も試す
+            const lastWhere = test => {
+                let found = -1;
+                pairs.forEach((p, i) => { if (i > 0 && p.count !== null && pairs.slice(0, i).every(q => test(p, q))) found = i; });
+                return found;
+            };
+            if (ti < 0) ti = lastWhere((p, q) => (q.count === null || p.count >= q.count) && p.amount >= q.amount);
+            if (ti < 0) ti = lastWhere((p, q) => q.count === null || p.count >= q.count);
+            if (ti < 0) {
+                pairs.forEach((p, i) => { if (p.count !== null && (ti < 0 || p.amount >= pairs[ti].amount)) ti = i; });
             }
-            return pairs;
+            if (ti < 0) return [];
+            const total = pairs[ti];
+            // 金額は右寄せで、■合計■の金額と右端がそろう。
+            // そろわないもの（ギフト名の「釣銭無」などを数字と誤認したもの）は除く
+            const kept = pairs.slice(0, ti + 1).filter(p => total.right === undefined || Math.abs(p.right - total.right) <= total.digitH * 0.8);
+            // ギフト名は、ひとつ前の「件数 金額」の行からこの行までの間（直前の2行まで）にある
+            const center = l => (l.y0 + l.y1) / 2;
+            kept.forEach((p, i) => {
+                const prevY = i > 0 ? kept[i - 1].y : -Infinity;
+                const between = labels.filter(l => center(l) > prevY + 5 && center(l) < p.y0).sort((x, y) => x.y0 - y.y0).slice(-2);
+                const aboveText = between.map(l => l.text).join('');
+                const codeMatch = aboveText.match(/(?:^|[^\d])(\d{1,2})[:：;]/);
+                p.name = aboveText + p.label;
+                p.code = codeMatch ? parseInt(codeMatch[1], 10) : null;
+            });
+            return kept;
         }
 
         // pairs: [{ y, count, amount, name }] を上から順に
@@ -1038,6 +1185,13 @@
             let candidates = total ? pairs.slice(0, -1) : pairs;
             // 合計と合わないときは、件数・金額の合計が■合計■と一致する組み合わせを探す
             // （明細でない行を明細と誤認した場合に備える）
+            // 件数が読めなかった明細が1つだけなら、■合計■の件数から逆算する
+            const noCount = candidates.filter(p => p.count === null);
+            if (total && noCount.length === 1) {
+                const rest = candidates.reduce((s, p) => s + (p.count || 0), 0);
+                noCount[0].count = total.count - rest > 0 ? total.count - rest : null;
+            }
+            candidates = candidates.filter(p => p.count !== null);
             const sums = list => [list.reduce((s, p) => s + p.count, 0), list.reduce((s, p) => s + p.amount, 0)];
             if (total && candidates.length <= 12) {
                 const [c0, a0] = sums(candidates);
@@ -1049,12 +1203,26 @@
                         if (c === total.count && a === total.amount && (!best || sub.length > best.length)) best = sub;
                     }
                     if (best) candidates = best;
+                    // 明細の合計と■合計■が、数字1文字の取り違えだけ違うなら■合計■の誤読とみなす
+                    else if ((c0 === total.count || variants(String(total.count)).includes(c0))
+                        && (a0 === total.amount || variants(String(total.amount)).includes(a0))) {
+                        total.count = c0;
+                        total.amount = a0;
+                    }
                 }
             }
             const entries = candidates.map(p => ({
-                type: giftTypeOf(p.name, p.code),
-                name: p.name, count: p.count, amount: p.amount,
+                type: giftTypeOf(p.name, p.code, p.count, p.amount),
+                name: p.name, count: p.count, amount: p.amount, guessed: false,
             }));
+            // 種類が分からない行が1つだけなら、毎日のように使われる「SCギフト 釣銭無」と推定する
+            // （他の行で使われていない場合だけ。画面で確認してもらう）
+            const unknown = entries.filter(e => !e.type);
+            const main = GIFT_TYPES.find(g => g.name === 'SCギフト 釣銭無');
+            if (unknown.length >= 1 && !entries.some(e => e.type === main)) {
+                unknown[0].type = main;
+                unknown[0].guessed = true;
+            }
             const checks = [];
             if (total) {
                 const sumA = entries.reduce((s, e) => s + e.amount, 0);
@@ -1066,7 +1234,7 @@
         }
 
         return {
-            findPaperColumns, estimateSkew, findNumberLines, segmentLine, readGroup, setTemplates,
+            findPaperColumns, paperScore, findPaperBox, estimateSkew, findNumberLines, segmentLine, readGroup, setTemplates,
             isGiftReport, labelAt, alignDailyRows, solveDailyReport, extractGiftPairs, solveGiftReport,
             glyphFeatures, classifyGlyph, distance, variants, digitsOf, GIFT_TYPES, DAILY_ROWS, GW, GH,
         };
@@ -1210,7 +1378,7 @@
                 return gray;
             }
 
-            // 時計回りに deg 度回した画像を返す（はみ出さないよう広げ、余白は灰色）
+            // 時計回りに deg 度回した画像を返す（はみ出さないよう広げ、余白は黒。紙と間違えないため）
             function rotateCanvas(source, deg) {
                 const rad = deg * Math.PI / 180;
                 const cos = Math.abs(Math.cos(rad)), sin = Math.abs(Math.sin(rad));
@@ -1218,7 +1386,7 @@
                 canvas.width = Math.round(source.width * cos + source.height * sin);
                 canvas.height = Math.round(source.width * sin + source.height * cos);
                 const ctx = canvas.getContext('2d');
-                ctx.fillStyle = '#808080';
+                ctx.fillStyle = '#000000';
                 ctx.fillRect(0, 0, canvas.width, canvas.height);
                 ctx.translate(canvas.width / 2, canvas.height / 2);
                 ctx.rotate(rad);
@@ -1232,13 +1400,19 @@
                 const img = await loadImage(file);
                 const base = drawScaled(img, Math.min(img.width, 2000));
                 const small = drawScaled(base, 600);
-                const skew = ReceiptCore.estimateSkew(grayOf(small), small.width, small.height);
+                // 傾きはレシートの文字だけで測る（机の木目に引きずられないよう、大まかな紙の範囲の内側を見る）
+                const rough = drawScaled(base, 300);
+                const roughBox = ReceiptCore.findPaperBox(ReceiptCore.paperScore(rough.getContext('2d').getImageData(0, 0, rough.width, rough.height).data, rough.width, rough.height), rough.width, rough.height);
+                const bw = (roughBox.right - roughBox.left) / rough.width, bh = (roughBox.bottom - roughBox.top) / rough.height;
+                const area = { x0: roughBox.left / rough.width + bw * 0.1, x1: roughBox.right / rough.width - bw * 0.1, y0: roughBox.top / rough.height + bh * 0.05, y1: roughBox.bottom / rough.height - bh * 0.05 };
+                const skew = ReceiptCore.estimateSkew(grayOf(small), small.width, small.height, area);
                 const rotated = Math.abs(skew) >= 0.2 ? rotateCanvas(base, -skew) : base;
 
                 const s300 = drawScaled(rotated, 300);
-                const cols = ReceiptCore.findPaperColumns(grayOf(s300), s300.width, s300.height);
+                const rgba = s300.getContext('2d').getImageData(0, 0, s300.width, s300.height).data;
+                const box = ReceiptCore.findPaperBox(ReceiptCore.paperScore(rgba, s300.width, s300.height), s300.width, s300.height);
                 const ratio = rotated.width / s300.width;
-                const canvas = drawScaled(rotated, OCR_WIDTH, cols.left * ratio, 0, (cols.right - cols.left) * ratio, rotated.height);
+                const canvas = drawScaled(rotated, OCR_WIDTH, box.left * ratio, box.top * ratio, (box.right - box.left) * ratio, (box.bottom - box.top) * ratio);
 
                 // 明るさの上下1%を除いた範囲を0〜255に引き伸ばす
                 const gray = grayOf(canvas);
@@ -1285,14 +1459,15 @@
                 const fromX = gift ? 0.4 : 0.45;
                 const items = [];
                 for (const ln of ReceiptCore.findNumberLines(im.gray, im.w, im.h, fromX)) {
-                    const pad = (ln.y1 - ln.y0) * 0.15;
+                    // 分割でできた行は上下の行と接しているので、余白を足さない
+                    const pad = ln.tight ? 0 : (ln.y1 - ln.y0) * 0.15;
                     const seg = ReceiptCore.segmentLine(im.gray, im.w, im.h, im.w * fromX, im.w, ln.y0 - pad, ln.y1 + pad);
                     if (!seg || !seg.groups.length) continue;
                     const groups = seg.groups.map(g => ReceiptCore.readGroup(seg, g).text);
-                    const lastGroup = seg.groups[seg.groups.length - 1];
+                    const rights = seg.groups.map(g => seg.x0 + g[g.length - 1].x1);
                     items.push({
-                        y: ln.y, y0: ln.y0, y1: ln.y1, groups, text: groups[groups.length - 1],
-                        right: seg.x0 + lastGroup[lastGroup.length - 1].x1, digitH: seg.digitH,
+                        y: ln.y, y0: ln.y0, y1: ln.y1, groups, rights, text: groups[groups.length - 1],
+                        right: rights[rights.length - 1], digitH: seg.digitH,
                         label: ReceiptCore.labelAt(labels, ln.y0, ln.y1),
                     });
                 }
@@ -1449,14 +1624,17 @@
 
                 const list = document.createElement('ul');
                 list.className = 'ocr-checks';
+                if (!result.total) list.appendChild(checkItem(false, '■合計■を読み取れなかったため検算できません'));
                 for (const c of result.checks) list.appendChild(checkItem(c.ok, (c.ok ? '検算OK: ' : '検算が合いません: ') + c.label));
                 crossCheck(list);
                 block.appendChild(list);
 
-                if (result.entries.some(e => !e.type)) {
-                    ocrStatus.textContent = '⚠ ギフトの種類を判別できない行があります。一覧で種類を選んでください。';
-                } else if (result.checks.some(c => !c.ok)) {
+                if (!result.total || result.checks.some(c => !c.ok)) {
                     ocrStatus.textContent = '⚠ 検算が合いません。撮り直すか、ギフト欄をレシートと見比べて修正してください。';
+                } else if (result.entries.some(e => e.guessed)) {
+                    ocrStatus.textContent = '⚠ ギフト名が読み取れなかった行を「SCギフト 釣銭無」と推定しました。種類が合っているか確認してください。';
+                } else if (result.entries.some(e => !e.type)) {
+                    ocrStatus.textContent = '⚠ ギフトの種類を判別できない行があります。一覧で種類を選んでください。';
                 } else {
                     ocrStatus.textContent = '読み取り完了。ギフトの種類と金額が合っているか確認してください。';
                 }
