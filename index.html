@@ -402,6 +402,10 @@
                     <label for="inputP">指定ギフト券 釣銭無 (ギフト別日報参照)</label>
                     <input type="number" id="inputP" value="">
                 </div>
+                <div class="input-group">
+                    <label for="inputS">ふるさと納税500 (ギフト別日報参照)</label>
+                    <input type="number" id="inputS" value="">
+                </div>
                 <button id="calculateBtn">計算</button>
             </div>
         </div>
@@ -1122,8 +1126,7 @@
         // ---------- ギフト別日報 ----------
         // ギフト名 → 入力欄。上から順に判定する（読み取りやすい文字を手がかりにする）
         const GIFT_TYPES = [
-            // ふるさと納税500 は対応する入力欄がまだないため、読み取っても反映せず確認を促す
-            { name: 'ふるさと納税500', amount: null, test: t => /ふるさと|ふる|るさ|納税|納/.test(t) },
+            { name: 'ふるさと納税500', amount: 'inputS', test: t => /ふるさと|ふる|るさ|納税|納/.test(t) },
             { name: '指定ギフト券 釣銭無', amount: 'inputP', test: t => /指定|定ギ/.test(t) },
             { name: 'ACS値引券 釣銭無', amount: 'inputI', test: t => /ACS|AC|値引|引券/.test(t) },
             { name: 'WAONポイント', amount: 'inputJ', test: t => /WAON|WA|AON|ON|ポイ|イント|ント/.test(t) },
@@ -2393,6 +2396,7 @@
                 const N = parseFloat(document.getElementById('inputN').value) || 0;
                 const O = parseFloat(document.getElementById('inputO').value) || 0;
                 const P = parseFloat(document.getElementById('inputP').value) || 0;
+                const S = parseFloat(document.getElementById('inputS').value) || 0;
                 const Q = parseFloat(document.getElementById('inputQ').value) || 0;
                 const R = parseFloat(document.getElementById('inputR').value) || 0;
 
@@ -2405,7 +2409,7 @@
                 const output11 = I;
                 const output12 = J;
                 const output13 = K;
-                const output15 = L + M + N + O;
+                const output15 = L + M + N + O + S;
                 const output16 = P;
                 const output14 = C - Q;
                 const output25 = R;
@@ -2460,7 +2464,7 @@
                 sales: '売上合計', tax: '消費税等', total: '＊＝合計', customers: 'レジ客数',
                 cash: '現金', gift: 'ギフト', credit: '掛売', salesNormal: '売上(通常)', salesReduced: '売上(軽減)',
             };
-            const GIFT_FIELD_IDS = ['inputD', 'inputE', 'inputF', 'inputG', 'inputH', 'inputI', 'inputJ', 'inputL', 'inputM', 'inputN', 'inputO', 'inputP'];
+            const GIFT_FIELD_IDS = ['inputD', 'inputE', 'inputF', 'inputG', 'inputH', 'inputI', 'inputJ', 'inputL', 'inputM', 'inputN', 'inputO', 'inputP', 'inputS'];
 
             let ocrWorker = null;
             let lastDaily = null; // 売上日報の読み取り結果（ギフト別日報との突き合わせ用）
