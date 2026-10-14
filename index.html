@@ -346,6 +346,10 @@
                     <input type="number" id="inputK" value="">
                 </div>
                 <div class="input-group">
+                    <label for="inputT">-ギフト過剰</label>
+                    <input type="number" id="inputT" value="">
+                </div>
+                <div class="input-group">
                     <label for="inputQ">⑤-ギフト釣銭</label>
                     <input type="number" id="inputQ" value="">
                 </div>
@@ -2398,11 +2402,13 @@
                 const P = parseFloat(document.getElementById('inputP').value) || 0;
                 const S = parseFloat(document.getElementById('inputS').value) || 0;
                 const Q = parseFloat(document.getElementById('inputQ').value) || 0;
+                const T = parseFloat(document.getElementById('inputT').value) || 0;
                 const R = parseFloat(document.getElementById('inputR').value) || 0;
 
                 const output1 = A;
                 const output3 = B;
-                const output4 = C - Q;
+                // 現金売上額はギフト過剰も引く。入金機投入金額（㉔）はギフト過剰を引かない
+                const output4 = C - Q - T;
                 const output5 = D + F;
                 const output6 = E + G;
                 const output10 = H;
@@ -2457,6 +2463,7 @@
                 { key: 'customers', id: 'inputB', label: '②レジ客数' },
                 { key: 'cash', id: 'inputC', label: '③+現金' },
                 { key: 'credit', id: 'inputK', label: '④+掛売' },
+                { key: 'giftExcess', id: 'inputT', label: '-ギフト過剰' },
                 { key: 'change', id: 'inputQ', label: '⑤-ギフト釣銭' },
                 { key: 'tax', id: 'inputR', label: '⑥+消費税等' },
             ];
