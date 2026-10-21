@@ -3019,6 +3019,7 @@
                 else if (lastGift && !lastDaily) text = '📷 続けて売上日報を撮影してください。';
                 ocrNext.textContent = text;
                 ocrNext.style.display = text ? 'block' : 'none';
+                return text;
             }
 
             // ---------- 読み取り ----------
@@ -3066,6 +3067,7 @@
                 ocrResult.innerHTML = '';
                 ocrRawWrap.style.display = 'none';
                 ocrNext.style.display = 'none';
+                let read = false;
                 try {
                     ocrStatus.textContent = '画像を補正中…';
                     const im = await prepareImage(file);
@@ -3090,13 +3092,16 @@
                         if (!rows) throw new Error('売上日報の項目を見つけられませんでした。撮り直してください');
                         handleDailyReport(ReceiptCore.solveDailyReport(rows));
                     }
+                    read = true;
                 } catch (err) {
                     console.error(err);
                     ocrStatus.textContent = '読み取りに失敗しました: ' + err.message;
                 } finally {
                     cameraButton.classList.remove('disabled');
                     receiptInput.value = '';
-                    updateNextPrompt();
+                    const next = updateNextPrompt();
+                    // 読み取り結果を画面に出してからメッセージボックスで知らせる
+                    if (read && next) setTimeout(() => alert(next.replace('📷 ', '')), 100);
                 }
             }
 
