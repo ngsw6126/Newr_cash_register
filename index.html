@@ -220,6 +220,16 @@
             font-size: 0.95rem;
             color: #34495e;
         }
+        #ocrNext {
+            display: none;
+            margin-top: 12px;
+            padding: 10px 12px;
+            border-radius: 6px;
+            background-color: #e8f1fb;
+            color: #1f5f99;
+            font-weight: 700;
+            text-align: center;
+        }
         .ocr-result-block {
             margin-top: 12px;
         }
@@ -319,6 +329,7 @@
             <input type="file" id="receiptInput" accept="image/*" capture="environment">
             <img id="ocrPreview" alt="読み取りに使った画像">
             <div id="ocrStatus"></div>
+            <div id="ocrNext"></div>
             <div id="ocrResult"></div>
             <details id="ocrRawWrap">
                 <summary>読み取った内容を表示</summary>
@@ -2890,6 +2901,7 @@
             const cameraButton = document.getElementById('cameraButton');
             const ocrPreview = document.getElementById('ocrPreview');
             const ocrStatus = document.getElementById('ocrStatus');
+            const ocrNext = document.getElementById('ocrNext');
             const ocrResult = document.getElementById('ocrResult');
             const ocrRawWrap = document.getElementById('ocrRawWrap');
             const ocrRaw = document.getElementById('ocrRaw');
@@ -3000,6 +3012,15 @@
                 return { canvas, gray, w: canvas.width, h: canvas.height, skew };
             }
 
+            // 片方の日報だけ読み取った後、もう片方の撮影を促す
+            function updateNextPrompt() {
+                let text = '';
+                if (lastDaily && !lastGift) text = '📷 続けてギフト別日報を撮影してください。';
+                else if (lastGift && !lastDaily) text = '📷 続けて売上日報を撮影してください。';
+                ocrNext.textContent = text;
+                ocrNext.style.display = text ? 'block' : 'none';
+            }
+
             // ---------- 読み取り ----------
             async function getWorker() {
                 if (!ocrWorker) {
@@ -3044,6 +3065,7 @@
                 cameraButton.classList.add('disabled');
                 ocrResult.innerHTML = '';
                 ocrRawWrap.style.display = 'none';
+                ocrNext.style.display = 'none';
                 try {
                     ocrStatus.textContent = '画像を補正中…';
                     const im = await prepareImage(file);
@@ -3074,6 +3096,7 @@
                 } finally {
                     cameraButton.classList.remove('disabled');
                     receiptInput.value = '';
+                    updateNextPrompt();
                 }
             }
 
