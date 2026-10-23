@@ -1158,7 +1158,7 @@
 
         // ギフト別日報のコード番号（「3:ＳＣギフト 釣銭無」の 3）→ ギフトの種類。
         // 名前より番号のほうが読み取りが安定しているので優先する（実物の日報で確認できたもの）
-        const GIFT_CODES = { 3: 'SCギフト 釣銭無', 5: 'SC500円券', 9: 'ふるさと納税500', 24: 'WAONポイント', 98: '指定ギフト券 釣銭無' };
+        const GIFT_CODES = { 3: 'SCギフト 釣銭無', 5: 'SC500円券', 9: 'ふるさと納税500', 22: 'SC商品券', 24: 'WAONポイント', 98: '指定ギフト券 釣銭無' };
 
         // 種類と、推定かどうか（推定なら画面で確認を促す）を返す
         function giftTypeOf(name, code, count, amount) {
@@ -2949,10 +2949,18 @@
                 return canvas;
             }
 
+            // 印字は黒なので、色の付いたもの（ロール紙の終わりを示すピンクの帯など）は明るい色に寄せて消す
             function grayOf(canvas) {
                 const d = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
                 const gray = new Uint8Array(canvas.width * canvas.height);
-                for (let i = 0; i < gray.length; i++) gray[i] = Math.round(0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2]);
+                for (let i = 0; i < gray.length; i++) {
+                    const r = d[i * 4], g = d[i * 4 + 1], b = d[i * 4 + 2];
+                    const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+                    const max = Math.max(r, g, b), sat = max - Math.min(r, g, b);
+                    // 彩度 20 まではそのまま、60 以上は最も明るい成分を使う
+                    const t = Math.max(0, Math.min(1, (sat - 20) / 40));
+                    gray[i] = Math.round(lum + (max - lum) * t);
+                }
                 return gray;
             }
 
